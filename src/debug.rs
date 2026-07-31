@@ -13,7 +13,9 @@ use binaryninja::debuginfo::{
     CustomDebugInfoParser, DebugFunctionInfo, DebugInfo, DebugInfoParser,
 };
 use binaryninja::rc::Ref;
-use binaryninja::types::{FunctionParameter, MemberAccess, MemberScope, StructureBuilder, Type};
+use binaryninja::types::{
+    FunctionParameter, MemberAccess, MemberScope, StructureBuilder, StructureType, Type,
+};
 use gimli::{AttributeValue, Dwarf, EndianSlice, LittleEndian, Reader, SectionId};
 
 use crate::module::{self, FunctionInfo, Module};
@@ -213,11 +215,14 @@ fn prototype(
     let mut cursor = unit.entries_at_offset(entry.offset()).ok()?;
     cursor.next_dfs().ok()?;
 
+    let mut level = 0isize;
     while let Ok(Some((delta, child))) = cursor.next_dfs() {
-        if delta < 0 {
+        // An inlined callee is a child too, and its parameters are not this function's
+        level += delta;
+        if level <= 0 {
             break;
         }
-        if child.tag() != gimli::DW_TAG_formal_parameter {
+        if level > 1 || child.tag() != gimli::DW_TAG_formal_parameter {
             continue;
         }
 
@@ -296,9 +301,8 @@ fn build_type(
                 None,
             ))
         }
-        gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type => {
-            structure(layout, dwarf, unit, offset, depth)
-        }
+        gimli::DW_TAG_structure_type => structure(layout, dwarf, unit, offset, depth, false),
+        gimli::DW_TAG_union_type => structure(layout, dwarf, unit, offset, depth, true),
         // A name for the same thing underneath, so it resolves to what it aliases
         gimli::DW_TAG_typedef
         | gimli::DW_TAG_const_type
@@ -317,17 +321,24 @@ fn structure(
     unit: &gimli::Unit<EndianSlice<LittleEndian>>,
     offset: gimli::UnitOffset,
     depth: usize,
+    union: bool,
 ) -> Option<Ref<Type>> {
     let mut builder = StructureBuilder::new();
+    if union {
+        builder.structure_type(StructureType::UnionStructureType);
+    }
     let mut cursor = unit.entries_at_offset(offset).ok()?;
     cursor.next_dfs().ok()?;
 
     let mut members = 0usize;
+    let mut level = 0isize;
     while let Ok(Some((delta, child))) = cursor.next_dfs() {
-        if delta < 0 {
+        // `next_dfs` reports the step, not the level, so a nested type's members are not these
+        level += delta;
+        if level <= 0 {
             break;
         }
-        if child.tag() != gimli::DW_TAG_member {
+        if level > 1 || child.tag() != gimli::DW_TAG_member {
             continue;
         }
 

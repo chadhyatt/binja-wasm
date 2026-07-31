@@ -661,10 +661,11 @@ impl WasmView {
 
         for (index, global) in primary.globals() {
             let address = self.layout.global_address(index);
-            self.handle.define_auto_data_var(
-                address,
-                value_type(global.kind, self.layout.pointer).as_ref(),
-            );
+            let ty = value_type(global.kind, self.layout.pointer);
+            // A `v128` is wider than the slot the region gives it, and would bury the next global
+            if global.kind.size() as u64 <= module::GLOBAL_STRIDE {
+                self.handle.define_auto_data_var(address, ty.as_ref());
+            }
 
             let name = primary.global_name(index);
             self.handle.define_auto_symbol(
@@ -812,6 +813,12 @@ fn without(covering: Vec<(u64, u64, bool)>, holes: &[(u64, u64)]) -> Vec<(u64, u
 /// exact, and the bytes between sections are still part of the file: the eight byte header, and
 /// every section's own id and length prefix
 fn covering(mut spans: Vec<(u64, u64, bool)>, base: u64, image: u64) -> Vec<(u64, u64, bool)> {
+    // A truncated file leaves a section past its own bytes, which the core backs without a word
+    spans.retain(|(start, end, _)| *start < image && *end > base);
+    for (start, end, _) in &mut spans {
+        *start = (*start).max(base);
+        *end = (*end).min(image);
+    }
     spans.sort_by_key(|(start, _, _)| *start);
 
     let mut covering: Vec<(u64, u64, bool)> = Vec::new();
@@ -1394,10 +1401,11 @@ mod tests {
 
     #[test]
     fn a_section_past_the_image_does_not_map_past_it() {
-        let covering = covering(vec![(8, 20, true)], 0, 12);
-        for (_, end, _) in &covering {
-            assert!(*end <= 20, "{covering:?}");
-        }
+        assert_eq!(
+            covering(vec![(8, 20, true)], 0, 12),
+            [(0, 8, false), (8, 12, true)]
+        );
+        assert_eq!(covering(vec![(20, 40, true)], 0, 12), [(0, 12, false)]);
     }
 
     #[test]

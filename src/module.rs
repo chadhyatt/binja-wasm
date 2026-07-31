@@ -16,6 +16,10 @@ const MAX_LOCALS: usize = 1 << 16;
 
 pub const MAX_IMAGE_LEN: usize = 256 << 20;
 
+/// The region is bytes the view builds, so its size is an allocation. Sixty times the largest
+/// table seen here
+pub const MAX_TABLE_SLOTS: u64 = 1 << 22;
+
 /// Nothing is stored at one, so the addresses only have to be distinct
 pub const IMPORT_STRIDE: u64 = 4;
 
@@ -459,6 +463,8 @@ pub struct Module {
     /// Initial size of each declared memory, in bytes
     pub memories: Vec<u64>,
     pub memory64: bool,
+    /// Declared size of each table, in slots
+    pub tables: Vec<u64>,
     pub data: Vec<DataSpan>,
     pub start: Option<u32>,
     /// The whole file for a core module, or the nested range when it came out of a component
@@ -482,13 +488,22 @@ impl Module {
             ),
             globals: self.globals.len() as u64,
             imports: self.imports.len() as u64,
-            tables: self
-                .elements
-                .keys()
-                .max()
-                .map_or(0, |slot| slot.saturating_add(1)),
+            tables: self.table_slots(),
             memory64: self.memory64,
         }
+    }
+
+    /// The table section says how big the table is; an element segment's offset does not
+    fn table_slots(&self) -> u64 {
+        let declared = self.tables.first().copied().unwrap_or(0);
+        let reached = self
+            .elements
+            .keys()
+            .max()
+            .map_or(0, |slot| slot.saturating_add(1));
+        // Nothing declared means an imported table, whose size is somebody else's
+        let slots = if declared == 0 { reached } else { declared };
+        slots.min(MAX_TABLE_SLOTS)
     }
 
     /// Reading a module needs a base and working out the base needs the module, so it is read at
@@ -817,7 +832,10 @@ pub fn parse_all(image: &[u8], base: u64) -> Vec<Module> {
         .into_iter()
         .filter_map(|span| {
             let start = span.start as u64;
-            parse(image.get(span)?, base + start)
+            let mut module = parse(image.get(span)?, base + start)?;
+            // The addresses are the file's already, so `place` has to measure from the file
+            module.layout = Layout::at(base, module.shape());
+            Some(module)
         })
         .collect()
 }
@@ -877,6 +895,10 @@ pub fn parse(image: &[u8], base: u64) -> Option<Module> {
                         module.tags.insert(next_tag, carried);
                         next_tag += 1;
                     }
+                    // An imported table takes index 0, ahead of any declared one
+                    if let TypeRef::Table(table) = import.ty {
+                        module.tables.push(table.initial);
+                    }
                     if let TypeRef::Memory(memory) = import.ty {
                         let page = 1u64 << memory.page_size_log2.unwrap_or(16);
                         module.memories.push(memory.initial.saturating_mul(page));
@@ -933,6 +955,11 @@ pub fn parse(image: &[u8], base: u64) -> Option<Module> {
                     module.memory64 |= memory.memory64;
                 }
             }
+            Payload::TableSection(reader) => {
+                for table in reader.into_iter().flatten() {
+                    module.tables.push(table.ty.initial);
+                }
+            }
             // What a `call_indirect` selects from: an index no active segment filled traps rather
             // than calling anything
             Payload::ElementSection(reader) => {
@@ -952,13 +979,23 @@ pub fn parse(image: &[u8], base: u64) -> Option<Module> {
                     let Some(at) = const_value(offset_expr) else {
                         continue;
                     };
-                    let wasmparser::ElementItems::Functions(items) = &element.items else {
-                        continue;
+                    // A slot naming no function stays empty, and the rest keep their own index
+                    let filled: Vec<Option<u32>> = match &element.items {
+                        wasmparser::ElementItems::Functions(items) => {
+                            items.clone().into_iter().map(|item| item.ok()).collect()
+                        }
+                        wasmparser::ElementItems::Expressions(_, items) => items
+                            .clone()
+                            .into_iter()
+                            .map(|item| item.ok().and_then(|expr| ref_func_index(&expr)))
+                            .collect(),
                     };
-                    for (nth, function) in items.clone().into_iter().flatten().enumerate() {
-                        module
-                            .elements
-                            .insert(at.saturating_add(nth as u64), function);
+                    for (nth, function) in filled.into_iter().enumerate() {
+                        if let Some(function) = function {
+                            module
+                                .elements
+                                .insert(at.saturating_add(nth as u64), function);
+                        }
                     }
                 }
             }
@@ -1066,9 +1103,17 @@ pub fn parse(image: &[u8], base: u64) -> Option<Module> {
 fn data_offset(segment: &wasmparser::Data) -> Option<u64> {
     use wasmparser::DataKind;
 
-    let DataKind::Active { offset_expr, .. } = &segment.kind else {
+    let DataKind::Active {
+        memory_index,
+        offset_expr,
+    } = &segment.kind
+    else {
         return None;
     };
+    // Only the first memory is mapped, and another one's offsets are a different address space
+    if *memory_index != 0 {
+        return None;
+    }
     const_value(offset_expr)
 }
 
@@ -1156,6 +1201,14 @@ fn const_value(expr: &wasmparser::ConstExpr) -> Option<u64> {
     match expr.get_operators_reader().read().ok()? {
         Operator::I32Const { value } => Some(value as u32 as u64),
         Operator::I64Const { value } => Some(value as u64),
+        _ => None,
+    }
+}
+
+/// The other encoding an element segment has for an entry: the expression that produces it
+fn ref_func_index(expr: &wasmparser::ConstExpr) -> Option<u32> {
+    match expr.get_operators_reader().read().ok()? {
+        Operator::RefFunc { function_index } => Some(function_index),
         _ => None,
     }
 }
@@ -1321,6 +1374,40 @@ mod tests {
                     &((info.end - info.start) as usize)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn placing_a_component_leaves_its_nested_modules_where_they_are() {
+        let image = build(
+            r#"(component
+                 (core module (func (result i32) i32.const 1))
+                 (core module (func (result i32) i32.const 2) (func nop)))"#,
+        );
+
+        let mut modules = parse_all(&image, 0);
+        let before: Vec<(u64, u64, Vec<u64>)> = modules
+            .iter()
+            .map(|module| {
+                (
+                    module.base,
+                    module.end,
+                    module.functions().map(|(_, info)| info.entry).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(modules.len(), 2);
+        assert_ne!(before[0].0, before[1].0, "they start at different offsets");
+
+        let layout = Layout::at(0, Shape::default());
+        for module in &mut modules {
+            module.place(layout);
+        }
+
+        for (module, (base, end, entries)) in modules.iter().zip(before) {
+            assert_eq!((module.base, module.end), (base, end));
+            let moved: Vec<u64> = module.functions().map(|(_, info)| info.entry).collect();
+            assert_eq!(moved, entries);
         }
     }
 
@@ -1579,6 +1666,32 @@ mod tests {
             &image[span.start as usize..span.end as usize],
             b"hello",
             "the span covers the contents and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_segment_belonging_to_another_memory_is_left_unplaced() {
+        let image = build(
+            r#"(module (memory 1) (memory 1) (func nop)
+                 (data (memory 0) (i32.const 16) "AAAA")
+                 (data (memory 1) (i32.const 16) "BBBB"))"#,
+        );
+        let module = parse(&image, 0).expect("parses");
+
+        let placed: Vec<_> = module
+            .data
+            .iter()
+            .map(|span| {
+                (
+                    span.memory_offset,
+                    &image[span.start as usize..span.end as usize],
+                )
+            })
+            .collect();
+        assert_eq!(
+            placed,
+            [(Some(16), &b"AAAA"[..]), (None, &b"BBBB"[..])],
+            "the first memory's segment is placed and the second memory's is not"
         );
     }
 
@@ -1902,7 +2015,11 @@ mod tests {
             None,
             "nothing fills the slots below it"
         );
-        assert_eq!(module.shape().tables, 5, "sized to the highest slot filled");
+        assert_eq!(
+            module.shape().tables,
+            8,
+            "sized to the table the module declared, not to the last slot a segment filled"
+        );
 
         // What a `call_indirect` on each type could reach without trapping
         let unary: Vec<_> = module
@@ -1915,12 +2032,70 @@ mod tests {
         assert!(module.table_slots_of_type(9).is_empty(), "no such type");
     }
 
+    /// What a module with reference types enabled emits
+    #[test]
+    fn an_element_segment_written_as_expressions_fills_the_same_slots() {
+        let image = build(
+            r#"(module
+                 (type $unary (func (param i32) (result i32)))
+                 (func $a (type $unary) local.get 0)
+                 (func $b (type $unary) local.get 0)
+                 (table 8 funcref)
+                 (elem (i32.const 2) funcref (ref.func $a) (ref.null func) (ref.func $b)))"#,
+        );
+        let module = parse(&image, 0).expect("parses");
+
+        assert_eq!(module.table_entry(2), Some(0));
+        assert_eq!(
+            module.table_entry(3),
+            None,
+            "a null entry traps rather than naming a function"
+        );
+        assert_eq!(
+            module.table_entry(4),
+            Some(1),
+            "and the slots after it keep their own index"
+        );
+        assert_eq!(module.shape().tables, 8, "the whole declared table");
+    }
+
+    #[test]
+    fn a_table_is_as_big_as_the_table_section_says() {
+        let image = build(r#"(module (func $f) (table 4 funcref) (elem (i32.const 1) $f))"#);
+        let module = parse(&image, 0).expect("parses");
+        assert_eq!(
+            module.shape().tables,
+            4,
+            "the declared size, not the filled one"
+        );
+
+        // An engine rejects this one, so the slot it names is unreachable
+        let reaching =
+            build(r#"(module (func $f) (table 4 funcref) (elem (i32.const 4294967200) $f))"#);
+        let module = parse(&reaching, 0).expect("parses");
+        assert!(
+            module
+                .table_entries()
+                .any(|(slot, _)| slot > u64::from(u32::MAX) / 2),
+            "the segment really does name a slot out there"
+        );
+        assert_eq!(
+            module.shape().tables,
+            4,
+            "and the region stays the size the table section declared"
+        );
+    }
+
     #[test]
     fn a_passive_element_segment_fills_no_slot() {
         let image = build(r#"(module (func $a) (table 4 funcref) (elem funcref (ref.func $a)))"#);
         let module = parse(&image, 0).expect("parses");
         assert_eq!(module.table_entries().count(), 0);
-        assert_eq!(module.shape().tables, 0);
+        assert_eq!(
+            module.shape().tables,
+            4,
+            "the table is still there, with every slot trapping"
+        );
     }
 
     #[test]

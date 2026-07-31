@@ -139,7 +139,6 @@ pub fn lift(
             let right = peek(il, model, 0, size);
             // A comparison is built at the width of what it compares, but the answer is an `i32`
             let result = compare(il, kind, size, left, right);
-            let result = il.expression(il.bool_to_int(RESULT_I32, result));
             il.add_instruction(il.store(RESULT_I32, slot(il, model, 1), result));
             pop(il, model, 1);
         }
@@ -147,7 +146,6 @@ pub fn lift(
             let value = peek(il, model, 0, size);
             let zero = il.const_int(size, 0);
             let result = compare(il, Cmp::Eq, size, value, zero);
-            let result = il.expression(il.bool_to_int(RESULT_I32, result));
             il.add_instruction(il.store(RESULT_I32, slot(il, model, 0), result));
         }
         Sem::Convert { from, to, kind } => {
@@ -259,11 +257,11 @@ fn lift_terminator(
         Terminator::Branch { taken, not_taken } => {
             let condition = branch_condition(il, model, insn);
 
-            // Some reference tests hand their operand to the label and drop it otherwise, so the
-            // fallthrough needs a pop the taken edge must not get
+            // A reference test consumes its operand on one edge and not the other, either way round
             let dropped = fallthrough_pops(insn);
+            let taken_dropped = taken_drops(insn);
             let leaving = recovered.unwind(0);
-            let fixup = dropped != 0 || !leaving.is_empty();
+            let fixup = dropped != 0 || taken_dropped != 0 || !leaving.is_empty();
 
             match (
                 il.label_for_address(*taken),
@@ -280,6 +278,10 @@ fn lift_terminator(
                     il.add_instruction(il.if_expr(condition, &mut hit, &mut miss));
 
                     il.mark_label(&mut hit);
+                    // Before the unwind, which counts from a height the operand has already left
+                    if taken_dropped != 0 {
+                        pop(il, model, taken_dropped);
+                    }
                     unwind(il, model, leaving);
                     go(il, model, Some(*taken));
 
@@ -311,8 +313,12 @@ fn lift_terminator(
             il.add_instruction(il.if_expr(condition, &mut leaving, &mut carry_on));
 
             il.mark_label(&mut leaving);
+            // As in `Branch`: the result `leave` reads sits under whatever the edge consumed
+            pop(il, model, taken_drops(insn));
             leave(il, model);
+
             il.mark_label(&mut carry_on);
+            pop(il, model, fallthrough_pops(insn));
             true
         }
         Terminator::Halt => {
@@ -391,18 +397,24 @@ fn lift_call(
         }
         // An index is not an address: the callee is whatever the slot holds, and naming the index
         // would point the call into linear memory
-        Operator::CallIndirect { .. } | Operator::ReturnCallIndirect { .. } => {
+        Operator::CallIndirect { table_index, .. }
+        | Operator::ReturnCallIndirect { table_index, .. } => {
             let held = temp(0);
             let index = peek(il, model, 0, model.addr);
             il.add_instruction(il.set_reg(model.addr, held, index));
             pop(il, model, 1);
 
-            let index = il.reg(model.addr, held);
-            let stride = il.const_int(model.addr, model.addr as u64);
-            let offset = il.expression(il.mul(model.addr, index, stride));
-            let base = il.const_ptr_sized(model.addr, model.table_base);
-            let at = il.expression(il.add(model.addr, base, offset));
-            il.expression(il.load(model.addr, at))
+            // Only the first table has a region, so an index into another one resolves to nothing
+            if table_index != 0 {
+                il.unimplemented()
+            } else {
+                let index = il.reg(model.addr, held);
+                let stride = il.const_int(model.addr, model.addr as u64);
+                let offset = il.expression(il.mul(model.addr, index, stride));
+                let base = il.const_ptr_sized(model.addr, model.table_base);
+                let at = il.expression(il.add(model.addr, base, offset));
+                il.expression(il.load(model.addr, at))
+            }
         }
         _ => return false,
     };
@@ -476,6 +488,14 @@ fn fallthrough_pops(insn: &Instruction) -> u64 {
         | Operator::BrOnCastDescEq { .. }
         | Operator::BrOnCastDescEqFail { .. } => 1,
         _ => 0,
+    }
+}
+
+/// What the taken edge consumes and [`branch_condition`] has not already popped
+fn taken_drops(insn: &Instruction) -> u64 {
+    match insn.op {
+        Operator::BrIf { .. } | Operator::If { .. } => 0,
+        ref op => u64::try_from(taken_pops(op)).unwrap_or(0),
     }
 }
 
@@ -793,7 +813,9 @@ fn push(il: &LowLevelILMutableFunction, model: Model) {
 }
 
 fn pop(il: &LowLevelILMutableFunction, model: Model, slots: u64) {
-    adjust_sp(il, model, (slots * SLOT) as i64);
+    if slots != 0 {
+        adjust_sp(il, model, (slots * SLOT) as i64);
+    }
 }
 
 /// A scratch register with no architectural counterpart, for a value that has to pass through
@@ -981,16 +1003,42 @@ fn binary<'a>(
         Bin::And => il.expression(il.and(size, left, right)),
         Bin::Or => il.expression(il.or(size, left, right)),
         Bin::Xor => il.expression(il.xor(size, left, right)),
-        Bin::Shl => il.expression(il.lsl(size, left, right)),
-        Bin::ShrS => il.expression(il.asr(size, left, right)),
-        Bin::ShrU => il.expression(il.lsr(size, left, right)),
-        Bin::Rotl => il.expression(il.rol(size, left, right)),
-        Bin::Rotr => il.expression(il.ror(size, left, right)),
+        Bin::Shl => {
+            let amount = shift_amount(il, size, right);
+            il.expression(il.lsl(size, left, amount))
+        }
+        Bin::ShrS => {
+            let amount = shift_amount(il, size, right);
+            il.expression(il.asr(size, left, amount))
+        }
+        Bin::ShrU => {
+            let amount = shift_amount(il, size, right);
+            il.expression(il.lsr(size, left, amount))
+        }
+        Bin::Rotl => {
+            let amount = shift_amount(il, size, right);
+            il.expression(il.rol(size, left, amount))
+        }
+        Bin::Rotr => {
+            let amount = shift_amount(il, size, right);
+            il.expression(il.ror(size, left, amount))
+        }
         Bin::FAdd => il.expression(il.fadd(size, left, right)),
         Bin::FSub => il.expression(il.fsub(size, left, right)),
         Bin::FMul => il.expression(il.fmul(size, left, right)),
         Bin::FDiv => il.expression(il.fdiv(size, left, right)),
     }
+}
+
+/// wasm shifts modulo the width and the IL does not, so `1 << 32` folded to 0. The mask folds away
+/// with any amount already in range
+fn shift_amount<'a>(
+    il: &'a LowLevelILMutableFunction,
+    size: usize,
+    amount: LowLevelILMutableExpression<'a, ValueExpr>,
+) -> LowLevelILMutableExpression<'a, ValueExpr> {
+    let mask = il.const_int(size, (size as u64 * 8).saturating_sub(1));
+    il.expression(il.and(size, amount, mask))
 }
 
 fn compare<'a>(
@@ -1018,6 +1066,7 @@ fn compare<'a>(
         Cmp::FLe => il.expression(il.fcmp_le(size, left, right)),
         Cmp::FGe => il.expression(il.fcmp_ge(size, left, right)),
     };
+    // Once: the callers store this, and converting twice rendered as `? 1 : 0 ? 1 : 0`
     il.expression(il.bool_to_int(RESULT_I32, condition))
 }
 

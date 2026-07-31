@@ -411,8 +411,12 @@ fn open_frame(
         body,
         end: None,
         otherwise: None,
-        // The frame's parameters are already on the stack, so its label unwinds to below them
-        base: arity.and(height).map(|h| h - i64::from(params)),
+        // The frame's parameters are already on the stack, so its label unwinds to below them, and
+        // a block declaring more than the stack holds has no base rather than one below the frame
+        base: arity
+            .and(height)
+            .map(|h| h - i64::from(params))
+            .filter(|base| *base >= 0),
         label_arity: if kind == FrameKind::Loop {
             params
         } else {
@@ -513,6 +517,7 @@ pub fn recover(code: &[u8], start: u64, module: Option<&Module>) -> ControlFlow 
                     height = height.map(|h| h - 1);
                 }
                 let frame = open_frame(&mut frames, kind, next, height, blockty, module);
+                flow.underflow |= frames[frame].base.is_none() && height.is_some();
                 open.push(frame);
                 if kind == FrameKind::If {
                     pending.push((addr, height, Pending::Conditional { frame, taken: next }));

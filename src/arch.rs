@@ -240,8 +240,9 @@ impl CallingConvention for WasmCallingConvention {
         None
     }
 
+    /// The same register: a result is a slot whatever its type, and [`lift::leave`] writes it there
     fn return_float_reg(&self) -> Option<RegisterId> {
-        None
+        Some(RegKind::Rv.id())
     }
 
     fn global_pointer_reg(&self) -> Option<RegisterId> {
@@ -625,7 +626,7 @@ impl Architecture for WasmArchitecture {
     }
 
     fn is_never_branch_patch_available(&self, data: &[u8], _addr: u64) -> bool {
-        asm::can_nop_out(data)
+        asm::can_never_branch(data)
     }
 
     /// Taking a branch unconditionally means dropping its condition first, and the extra opcode
@@ -775,14 +776,14 @@ fn operand_tokens(operand: &Operand) -> Vec<(String, InstructionTextTokenKind)> 
             },
         )],
         Operand::F32(value) => vec![(
-            value.to_string(),
+            insn::wat_f32(*value),
             InstructionTextTokenKind::FloatingPoint {
                 value: f64::from(*value),
                 size: Some(4),
             },
         )],
         Operand::F64(value) => vec![(
-            value.to_string(),
+            insn::wat_f64(*value),
             InstructionTextTokenKind::FloatingPoint {
                 value: *value,
                 size: Some(8),
@@ -827,6 +828,11 @@ fn operand_tokens(operand: &Operand) -> Vec<(String, InstructionTextTokenKind)> 
                     InstructionTextTokenKind::Annotation,
                 ));
             }
+            // The order the text format writes them in, and the only one the assembler takes
+            tokens.push((
+                format!("offset={offset}"),
+                InstructionTextTokenKind::Annotation,
+            ));
             // The text format writes the byte count, and a value with no byte count is no
             // alignment at all, so it is shown as the power it claims to be
             tokens.push((
@@ -834,10 +840,6 @@ fn operand_tokens(operand: &Operand) -> Vec<(String, InstructionTextTokenKind)> 
                     Some(bytes) => format!("align={bytes}"),
                     None => format!("align=2^{align}"),
                 },
-                InstructionTextTokenKind::Annotation,
-            ));
-            tokens.push((
-                format!("offset={offset}"),
                 InstructionTextTokenKind::Annotation,
             ));
             tokens
@@ -983,7 +985,7 @@ mod tests {
                 offset: 16,
                 memory: 0
             }),
-            ["align=4", "offset=16"]
+            ["offset=16", "align=4"]
         );
         assert_eq!(
             render(&Operand::MemArg {
@@ -991,7 +993,7 @@ mod tests {
                 offset: 0,
                 memory: 2
             }),
-            ["memory=2", "align=1", "offset=0"]
+            ["memory=2", "offset=0", "align=1"]
         );
     }
 
@@ -1003,7 +1005,7 @@ mod tests {
                 offset: 1,
                 memory: 0
             }),
-            ["align=2^96", "offset=1"]
+            ["offset=1", "align=2^96"]
         );
         assert_eq!(
             render(&Operand::MemArg {
@@ -1011,7 +1013,7 @@ mod tests {
                 offset: 0,
                 memory: 0
             }),
-            ["align=9223372036854775808", "offset=0"]
+            ["offset=0", "align=9223372036854775808"]
         );
     }
 

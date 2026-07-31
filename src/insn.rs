@@ -216,16 +216,19 @@ macro_rules! define_operator_table {
             Some(wat_name(visitor_name(op)?))
         }
 
-        /// Every operand an operator carries, in encoding order
+        /// Every operand an operator carries, in the order the text format writes them
         pub fn operands(op: &Operator) -> Vec<Operand> {
-            match op {
+            let mut operands = match op {
                 $(
                     Operator::$op $({ $($arg),* })? => vec![
                         $($(Payload::operand($arg, stringify!($arg))),*)?
                     ],
                 )*
                 _ => Vec::new(),
-            }
+            };
+            text_format_order(&mut operands);
+            reference_type_spelling(op, &mut operands);
+            operands
         }
 
         /// `None` for the operators whose effect depends on a type declared elsewhere
@@ -260,6 +263,38 @@ pub fn operator_id(op: &Operator) -> Option<u32> {
     });
 
     by_name.get(visitor_name(op)?).copied()
+}
+
+/// The text format writes the space first, the encoding what it selects. Stable, so `memory.copy`
+/// keeps its destination before its source
+fn text_format_order(operands: &mut [Operand]) {
+    let names_a_space = |operand: &Operand| match operand {
+        Operand::Index { field, .. } => !matches!(
+            *field,
+            "data_index" | "elem_index" | "type_index" | "segment" | "seg"
+        ),
+        _ => true,
+    };
+
+    let mut ordered: Vec<Operand> = operands
+        .iter()
+        .filter(|o| names_a_space(o))
+        .cloned()
+        .collect();
+    ordered.extend(operands.iter().filter(|o| !names_a_space(o)).cloned());
+    operands.clone_from_slice(&ordered);
+}
+
+/// Nullability is in the opcode for these, and the text format writes it on the operand
+fn reference_type_spelling(op: &Operator, operands: &mut [Operand]) {
+    let nullable = match op {
+        Operator::RefTestNullable { .. } | Operator::RefCastNullable { .. } => "null ",
+        Operator::RefTestNonNull { .. } | Operator::RefCastNonNull { .. } => "",
+        _ => return,
+    };
+    if let Some(Operand::Type(ty)) = operands.first_mut() {
+        *ty = format!("(ref {nullable}{ty})");
+    }
 }
 
 pub fn operator_name(id: u32) -> Option<String> {
@@ -298,6 +333,47 @@ pub fn wat_name(visit: &str) -> String {
     out.push('.');
     out.push_str(&tokens[segments..].join("_"));
     out
+}
+
+/// Rust spells a NaN `NaN`, which the format has no token for, and prints every payload the same
+pub fn wat_f32(value: f32) -> String {
+    let bits = value.to_bits();
+    match nan_payload(value.is_nan(), u64::from(bits & 0x007f_ffff), 0x0040_0000) {
+        Some(spelling) => format!("{}{spelling}", sign_of(bits >> 31 != 0)),
+        None => value.to_string(),
+    }
+}
+
+pub fn wat_f64(value: f64) -> String {
+    let bits = value.to_bits();
+    match nan_payload(
+        value.is_nan(),
+        bits & 0x000f_ffff_ffff_ffff,
+        0x0008_0000_0000_0000,
+    ) {
+        Some(spelling) => format!("{}{spelling}", sign_of(bits >> 63 != 0)),
+        None => value.to_string(),
+    }
+}
+
+/// `nan` on its own is the canonical one, and any other needs its payload written out
+fn nan_payload(is_nan: bool, payload: u64, canonical: u64) -> Option<String> {
+    if !is_nan {
+        return None;
+    }
+    Some(if payload == canonical {
+        "nan".to_owned()
+    } else {
+        format!("nan:{payload:#x}")
+    })
+}
+
+fn sign_of(negative: bool) -> &'static str {
+    if negative {
+        "-"
+    } else {
+        ""
+    }
 }
 
 /// Operators whose visitor name carries more than the text format spells out
@@ -388,8 +464,8 @@ impl Payload for BlockType {
     fn operand(&self, _field: &'static str) -> Operand {
         Operand::BlockType(match self {
             BlockType::Empty => None,
-            BlockType::Type(ty) => Some(ty.to_string()),
-            BlockType::FuncType(index) => Some(format!("type={index}")),
+            BlockType::Type(ty) => Some(format!("(result {ty})")),
+            BlockType::FuncType(index) => Some(format!("(type {index})")),
         })
     }
 }
@@ -458,7 +534,7 @@ fn abstract_heap_type_name(ty: AbstractHeapType) -> &'static str {
 
 fn type_index_name(index: &UnpackedIndex) -> String {
     match index {
-        UnpackedIndex::Module(index) => format!("type={index}"),
+        UnpackedIndex::Module(index) => index.to_string(),
         UnpackedIndex::RecGroup(index) => format!("rec={index}"),
         // `wasmparser` grows a third variant when its validator is compiled in, as the
         // conformance harness does
@@ -553,6 +629,25 @@ mod tests {
     }
 
     #[test]
+    fn a_float_is_spelled_the_way_the_text_format_spells_it() {
+        assert_eq!(wat_f32(1.5), "1.5");
+        assert_eq!(wat_f32(-0.0), "-0");
+        assert_eq!(wat_f32(f32::INFINITY), "inf");
+        assert_eq!(wat_f32(f32::NEG_INFINITY), "-inf");
+        assert_eq!(wat_f32(f32::NAN), "nan");
+        assert_eq!(wat_f32(f32::from_bits(0x7fc0_0000)), "nan");
+        assert_eq!(wat_f32(f32::from_bits(0xffc0_0000)), "-nan");
+        assert_eq!(wat_f32(f32::from_bits(0x7f80_0001)), "nan:0x1");
+        assert_eq!(wat_f32(f32::from_bits(0x7fa0_0000)), "nan:0x200000");
+
+        assert_eq!(wat_f64(1.5), "1.5");
+        assert_eq!(wat_f64(f64::INFINITY), "inf");
+        assert_eq!(wat_f64(f64::NAN), "nan");
+        assert_eq!(wat_f64(f64::from_bits(0xfff8_0000_0000_0000)), "-nan");
+        assert_eq!(wat_f64(f64::from_bits(0x7ff0_0000_0000_0001)), "nan:0x1");
+    }
+
+    #[test]
     fn lengths_cover_the_immediates() {
         assert_eq!(decoded(&[0x6a]).len, 1);
         assert_eq!(decoded(&[0x20, 0x83, 0x01]).len, 3);
@@ -577,18 +672,47 @@ mod tests {
                 value: 7
             }]
         );
+        // The bytes carry the type first, the text format the table
         assert_eq!(
             decoded(&[0x11, 0x02, 0x01]).operands(),
             [
                 Operand::Index {
-                    field: "type_index",
-                    value: 2
-                },
-                Operand::Index {
                     field: "table_index",
                     value: 1
+                },
+                Operand::Index {
+                    field: "type_index",
+                    value: 2
                 }
             ]
+        );
+    }
+
+    /// The orders `wasmprinter` prints for these bytes
+    #[test]
+    fn two_index_operators_are_written_the_way_the_text_format_writes_them() {
+        let fields = |bytes: &[u8]| -> Vec<(&'static str, u32)> {
+            decoded(bytes)
+                .operands()
+                .into_iter()
+                .filter_map(|operand| match operand {
+                    Operand::Index { field, value } => Some((field, value)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            fields(&[0xfc, 0x08, 0x00, 0x01]),
+            [("mem", 1), ("data_index", 0)]
+        );
+        assert_eq!(
+            fields(&[0xfc, 0x0c, 0x00, 0x01]),
+            [("table", 1), ("elem_index", 0)]
+        );
+        assert_eq!(
+            fields(&[0xfc, 0x0a, 0x01, 0x00]),
+            [("dst_mem", 1), ("src_mem", 0)]
         );
     }
 
@@ -648,11 +772,11 @@ mod tests {
         );
         assert_eq!(
             decoded(&[0x03, 0x7f]).operands(),
-            [Operand::BlockType(Some("i32".to_owned()))]
+            [Operand::BlockType(Some("(result i32)".to_owned()))]
         );
         assert_eq!(
             decoded(&[0x04, 0x07]).operands(),
-            [Operand::BlockType(Some("type=7".to_owned()))]
+            [Operand::BlockType(Some("(type 7)".to_owned()))]
         );
     }
 

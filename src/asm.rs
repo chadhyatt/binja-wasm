@@ -98,8 +98,21 @@ pub fn nop_out(data: &mut [u8]) -> bool {
     true
 }
 
+/// Whether the branch this instruction makes can be neutralised where it stands
+pub fn can_never_branch(data: &[u8]) -> bool {
+    insn::decode(data).is_some_and(|insn| matches!(insn.op, wasmparser::Operator::BrIf { .. }))
+        && nop_replacement(data).is_some()
+}
+
 fn nop_replacement(data: &[u8]) -> Option<(usize, usize)> {
     let insn = insn::decode(data)?;
+
+    // Its condition goes either way, so dropping that alone neutralises it; the arity table
+    // cannot say so, since entering the block also moves its parameters
+    if matches!(insn.op, wasmparser::Operator::BrIf { .. }) {
+        return (1 <= insn.len).then_some((1, insn.len));
+    }
+
     let arity = insn.arity()?;
 
     // A produced value has nothing to come from, and dropping a branch changes which code runs
@@ -232,6 +245,22 @@ mod tests {
             let mut bytes = assemble(text).unwrap();
             assert!(!can_nop_out(&bytes), "{text}");
             assert!(!nop_out(&mut bytes), "{text}");
+        }
+    }
+
+    #[test]
+    fn only_a_conditional_branch_can_be_made_never_to_branch() {
+        let mut br_if = assemble("br_if 0").unwrap();
+        assert!(can_never_branch(&br_if));
+        assert!(nop_out(&mut br_if));
+        assert_eq!(
+            br_if,
+            [DROP, NOP],
+            "the condition goes, the branch does not happen"
+        );
+
+        for text in ["drop", "local.set 0", "nop", "br 0", "i32.add"] {
+            assert!(!can_never_branch(&assemble(text).unwrap()), "{text}");
         }
     }
 
