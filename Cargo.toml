@@ -1,0 +1,29 @@
+[workspace]
+members = ["conformance"]
+
+[package]
+name = "binja_wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["core"]
+core = ["binaryninja/core", "binaryninjacore-sys/core"]
+
+[dependencies]
+binaryninja = { git = "https://github.com/Vector35/binaryninja-api.git", tag = "stable/5.3.9757", default-features = false }
+binaryninjacore-sys = { git = "https://github.com/Vector35/binaryninja-api.git", tag = "stable/5.3.9757", default-features = false }
+tracing = "0.1"
+wasmparser = { version = "0.255.0", default-features = false, features = ["features", "simd", "component-model"] }
+wat = { version = "1.254.0", default-features = false, features = ["component-model"] }
+gimli = { version = "0.31", default-features = false, features = ["read", "std"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

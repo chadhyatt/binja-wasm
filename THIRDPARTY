@@ -1,0 +1,9 @@
+Third party licences
+====================
+
+binja-wasm is MIT licensed, see LICENSE. The plugin library also contains code from:
+
+  binaryninja, binaryninjacore-sys   Apache-2.0, Copyright 2021-2026 Vector 35 Inc
+  wasmparser, wat                    Apache-2.0 WITH LLVM-exception, or Apache-2.0, or MIT
+  gimli                              MIT or Apache-2.0
+  tracing                            MIT

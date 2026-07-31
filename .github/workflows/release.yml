@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            targets: --target linux-x86_64 --target linux-arm64
+            setup: >-
+              sudo apt-get update && sudo apt-get install -y cmake ninja-build
+              gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          - runner: macos-14
+            targets: --target macos-x86_64 --target macos-arm64
+            setup: for f in cmake ninja; do brew list $f >/dev/null 2>&1 || brew install $f; done
+          - runner: windows-2022
+            targets: --target windows-x86_64
+            setup: choco install ninja -y
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: ${{ matrix.setup }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.runner }}
+
+      - name: Build and package
+        run: python scripts/dist.py --ref "${{ github.ref_name }}" ${{ matrix.targets }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binja-wasm-${{ matrix.runner }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - id: name
+        run: |
+          api=$(python -c "import json; print(json.load(open('version.json'))['api'])")
+          echo "release=${{ github.ref_name }} (BN $api)" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.name.outputs.release }}
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
