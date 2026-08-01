@@ -13,6 +13,7 @@ use binaryninja::binary_view::{
     register_binary_view_event, BinaryView, BinaryViewBase, BinaryViewEventType, BinaryViewExt,
     Result,
 };
+use binaryninja::confidence::Conf;
 use binaryninja::custom_binary_view::{
     register_view_type, BinaryViewType, BinaryViewTypeBase, CustomBinaryView, CustomBinaryViewType,
     CustomView, CustomViewBuilder,
@@ -865,6 +866,7 @@ fn declare(view: &BinaryView, module: &Module, platform: &Platform) {
                 if let Some(prototype) = prototype(view, module, index, &import.signature) {
                     stub.set_user_type(&prototype);
                 }
+                stub.set_user_pure(Conf::new(false, binaryninja::confidence::MAX_CONFIDENCE));
                 bind_parameters(&stub, &import.signature);
             }
             None => stubs_failed += 1,
