@@ -1171,6 +1171,52 @@ fn drop_invented_functions(view: &BinaryView) {
     }
 }
 
+fn note_addresses_inside_strings(view: &BinaryView) {
+    let Some(layout) = module::layout(arch::view_id(view)) else {
+        return;
+    };
+
+    let mut strings: Vec<(u64, u64)> = view
+        .strings()
+        .iter()
+        .filter(|string| layout.memory_mapped(string.start))
+        .map(|string| (string.start, string.start + string.length as u64))
+        .collect();
+    strings.sort_unstable();
+
+    let mut noted = 0usize;
+    for variable in view.data_variables().iter() {
+        if !variable.auto_discovered || !layout.memory_mapped(variable.address) {
+            continue;
+        }
+        let at = strings.partition_point(|(start, _)| *start <= variable.address);
+        let Some(&(start, end)) = at.checked_sub(1).and_then(|index| strings.get(index)) else {
+            continue;
+        };
+        if variable.address <= start || variable.address >= end {
+            continue;
+        }
+        if view
+            .comment_at(variable.address)
+            .is_some_and(|had| !had.is_empty())
+        {
+            continue;
+        }
+        view.set_comment_at(
+            variable.address,
+            &format!(
+                "wasm: {} bytes into the string at {start:#x}",
+                variable.address - start
+            ),
+        );
+        noted += 1;
+    }
+
+    if noted != 0 {
+        tracing::info!("wasm view: noted {noted} data variables that start inside a string");
+    }
+}
+
 /// Set against the view rather than globally, so nothing but the files this plugin claims is
 /// analysed differently; the load settings would be tidier, but neither key is in that schema
 fn choose_analysis(view: &BinaryView) {
@@ -1208,6 +1254,7 @@ pub fn register_workflow() {
 
     let activity = Activity::new_with_action(config, |context: &AnalysisContext| {
         drop_invented_functions(&context.view());
+        note_addresses_inside_strings(&context.view());
     });
 
     let Some(core) = Workflow::get(ROOT) else {
