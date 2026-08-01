@@ -8,7 +8,7 @@
   "api": [
     "rust"
   ],
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Chad Hyatt",
   "minimumbinaryninjaversion": 9757,
   "description": "WebAssembly architecture plugin for Binary Ninja",

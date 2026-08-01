@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "binja_wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "binaryninja",
  "binaryninjacore-sys",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "conformance"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "binaryninjacore-sys",
  "binja_wasm",
