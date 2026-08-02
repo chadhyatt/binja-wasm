@@ -598,6 +598,10 @@ impl Module {
         self.imports.iter().map(|(index, info)| (*index, info))
     }
 
+    pub fn import(&self, index: u32) -> Option<&ImportInfo> {
+        self.imports.get(&index)
+    }
+
     /// Failing every name the module gives, the index, since a `.wasm` has no addresses of its own
     pub fn name_of(&self, function: u32) -> String {
         if let Some(name) = self.names.get(&function) {

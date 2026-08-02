@@ -23,7 +23,7 @@ use binaryninja::platform::Platform;
 use binaryninja::rc::Ref;
 use binaryninja::section::{SectionBuilder, Semantics};
 use binaryninja::segment::{SegmentBuilder, SegmentFlags};
-use binaryninja::settings::{QueryOptions, Settings, SettingsScope};
+use binaryninja::settings::Settings;
 use binaryninja::symbol::{Binding, Symbol, SymbolType};
 use binaryninja::types::{
     FunctionParameter, MemberAccess, MemberScope, QualifiedName, StructureBuilder, Type,
@@ -36,6 +36,7 @@ use crate::arch;
 use crate::cfg;
 use crate::lift;
 use crate::module::{self, Module, Signature, ValueKind};
+use crate::settings;
 
 pub const NAME: &str = "WASM";
 
@@ -74,21 +75,10 @@ impl BinaryViewTypeBase for WasmViewType {
     /// every core's load settings schema
     fn load_settings_for_data(&self, data: &BinaryView) -> Option<Ref<Settings>> {
         let settings = self.default_load_settings_for_data(data)?;
-        if settings.contains(NO_SWEEP) {
-            settings.set_bool(NO_SWEEP, false);
-        }
-        // Selected here rather than globally, so nothing but the files this plugin claims is
-        // analysed any differently
-        if settings.contains(MODULE_WORKFLOW) && Workflow::get(WORKFLOW).is_some() {
-            settings.set_string(MODULE_WORKFLOW, WORKFLOW);
-        }
+        settings::for_load(&settings, WORKFLOW);
         Some(settings)
     }
 }
-
-const NO_SWEEP: &str = "analysis.linearSweep.autorun";
-
-const MODULE_WORKFLOW: &str = "analysis.workflows.moduleWorkflow";
 
 impl CustomBinaryViewType for WasmViewType {
     fn create_custom_view<'builder>(
@@ -999,7 +989,7 @@ fn prototype(
 ///
 /// The name and whether it is a float stay the module's own; only the width is the slot's, which an
 /// `i32` really does occupy the low half of
-fn parameter_type(kind: ValueKind) -> Ref<Type> {
+pub(crate) fn parameter_type(kind: ValueKind) -> Ref<Type> {
     let slot = lift::SLOT as usize;
     match kind {
         ValueKind::I32 | ValueKind::I64 => Type::named_int(slot, true, kind.name()),
@@ -1008,7 +998,7 @@ fn parameter_type(kind: ValueKind) -> Ref<Type> {
     }
 }
 
-fn parameter_slot(nth: u32) -> Variable {
+pub(crate) fn parameter_slot(nth: u32) -> Variable {
     Variable::new(
         VariableSourceType::StackVariableSourceType,
         0,
@@ -1058,7 +1048,7 @@ fn entry_of(module: &Module) -> Option<u64> {
 
 /// Named as the text format does, so a prototype reads the way its source did rather than in C
 /// spellings nothing in the file mentions
-fn value_type(kind: ValueKind, pointer: usize) -> Ref<Type> {
+pub(crate) fn value_type(kind: ValueKind, pointer: usize) -> Ref<Type> {
     match kind {
         ValueKind::I32 => Type::named_int(4, true, "i32"),
         ValueKind::I64 => Type::named_int(8, true, "i64"),
@@ -1219,19 +1209,8 @@ fn note_addresses_inside_strings(view: &BinaryView) {
     }
 }
 
-/// Set against the view rather than globally, so nothing but the files this plugin claims is
-/// analysed differently; the load settings would be tidier, but neither key is in that schema
 fn choose_analysis(view: &BinaryView) {
-    let settings = Settings::new();
-    let options =
-        QueryOptions::new_with_view(view).with_scope(SettingsScope::SettingsResourceScope);
-
-    if settings.contains(NO_SWEEP) {
-        settings.set_bool_with_opts(NO_SWEEP, false, &options);
-    }
-    if settings.contains(MODULE_WORKFLOW) && Workflow::get(WORKFLOW).is_some() {
-        settings.set_string_with_opts(MODULE_WORKFLOW, WORKFLOW, &options);
-    }
+    settings::for_view(view, WORKFLOW);
 }
 
 /// The core's own workflow ends with `core.module.deleteUnusedAutoFunctions`, which is this same

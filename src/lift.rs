@@ -43,14 +43,18 @@ pub struct Frame {
     pub entry: bool,
 }
 
+pub fn local_slot(params: u32, index: u32) -> i64 {
+    match index.checked_sub(params) {
+        None => i64::from(index) * SLOT as i64,
+        Some(declared) => -(i64::from(declared) + 1) * SLOT as i64,
+    }
+}
+
 impl Frame {
     /// Parameters run up from the base in declaration order, where [`argument_frame`] puts them,
     /// and the declared locals go below
     fn offset(self, index: u32) -> i64 {
-        match index.checked_sub(self.params) {
-            None => i64::from(index) * SLOT as i64,
-            Some(declared) => -(i64::from(declared) + 1) * SLOT as i64,
-        }
+        local_slot(self.params, index)
     }
 
     fn reserved(self) -> i64 {
@@ -1363,6 +1367,27 @@ mod tests {
 
     fn sem(data: &[u8]) -> Sem {
         semantics(&decode(data).expect("decodes"))
+    }
+
+    #[test]
+    fn a_local_sits_where_the_frame_says() {
+        assert_eq!(local_slot(2, 0), 0);
+        assert_eq!(local_slot(2, 1), SLOT as i64);
+        assert_eq!(local_slot(2, 2), -(SLOT as i64));
+        assert_eq!(local_slot(2, 3), -2 * SLOT as i64);
+        assert_eq!(
+            local_slot(0, 0),
+            -(SLOT as i64),
+            "a body with no parameters"
+        );
+
+        let frame = Frame {
+            params: 2,
+            ..Frame::default()
+        };
+        for index in 0..4 {
+            assert_eq!(frame.offset(index), local_slot(2, index));
+        }
     }
 
     #[test]
