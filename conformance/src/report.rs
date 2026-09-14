@@ -28,10 +28,12 @@ pub struct Report {
     /// fail to merge
     pub unwinding: u64,
     pub failures: Vec<String>,
-    /// Corpus files nothing could be read out of, which is a hole rather than a pass
+    /// Corpus files with forms nothing could be read out of, which is a hole rather than a pass
     pub unreadable: Vec<String>,
     /// The ones already known to be unreadable, listed so the count staying put is visible
     pub expected_unreadable: Vec<String>,
+    /// Listed as unreadable but read in full, so the list is out of date
+    pub stale_expectations: Vec<String>,
     /// Failures past this many are counted but not kept
     limit: usize,
     dropped: usize,
@@ -56,6 +58,7 @@ impl Report {
             failures: Vec::new(),
             unreadable: Vec::new(),
             expected_unreadable: Vec::new(),
+            stale_expectations: Vec::new(),
             limit,
             dropped: 0,
         }
@@ -66,6 +69,7 @@ impl Report {
     pub fn passed(&self) -> bool {
         self.failures.is_empty()
             && self.unreadable.is_empty()
+            && self.stale_expectations.is_empty()
             && self.modules > 0
             && self.functions > 0
             && self.instructions > 0
@@ -166,7 +170,7 @@ impl Report {
 
         if !self.expected_unreadable.is_empty() && !quiet {
             println!(
-                "\n{} files skipped, each for a known reason:",
+                "\n{} files with forms skipped, each for a known reason:",
                 self.expected_unreadable.len()
             );
             for file in &self.expected_unreadable {
@@ -176,10 +180,20 @@ impl Report {
 
         if !self.unreadable.is_empty() {
             println!(
-                "\n{} files nothing could be read out of:",
+                "\n{} files with forms nothing could be read out of:",
                 self.unreadable.len()
             );
             for file in &self.unreadable {
+                println!("  {file}");
+            }
+        }
+
+        if !self.stale_expectations.is_empty() {
+            println!(
+                "\n{} files read in full but listed as unreadable, so drop them from the list:",
+                self.stale_expectations.len()
+            );
+            for file in &self.stale_expectations {
                 println!("  {file}");
             }
         }

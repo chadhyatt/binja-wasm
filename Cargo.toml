@@ -12,11 +12,11 @@ publish = false
 binja_wasm = { path = ".", default-features = false }
 binaryninja = { git = "https://github.com/Vector35/binaryninja-api.git", tag = "stable/6.0.10601", default-features = false }
 binaryninjacore-sys = { git = "https://github.com/Vector35/binaryninja-api.git", tag = "stable/6.0.10601", default-features = false }
-tracing = "0.1"
-wasmparser = { version = "0.255.0", default-features = false }
-wat = { version = "1.254.0", default-features = false }
-wast = "254.0.0"
-gimli = { version = "0.31", default-features = false }
+tracing = "0.1.44"
+wasmparser = { version = "0.259.0", default-features = false }
+wat = { version = "1.259.0", default-features = false }
+wast = "259.0.0"
+gimli = { version = "0.34.0", default-features = false }
 
 [package]
 name = "binja_wasm"

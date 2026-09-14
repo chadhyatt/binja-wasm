@@ -58,7 +58,7 @@ pub fn decode_any(data: &[u8]) -> Option<Instruction<'_>> {
         if let Ok(op) = reader.visit_operator(&mut OperatorFactory { frame }) {
             return Some(Instruction {
                 op,
-                len: reader.original_position(),
+                len: usize::try_from(reader.original_position()).ok()?,
             });
         }
     }

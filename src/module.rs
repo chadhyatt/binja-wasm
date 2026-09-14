@@ -445,6 +445,10 @@ pub struct Module {
     exports: BTreeMap<u32, String>,
     names: BTreeMap<u32, String>,
     locals: BTreeMap<u32, BTreeMap<u32, String>>,
+    /// By type index, from the extended name section; a function's own local names come first
+    parameter_names: BTreeMap<u32, BTreeMap<u32, String>>,
+    /// Type index per function index, imports included
+    function_types: BTreeMap<u32, u32>,
     /// Parameters first, per function index; the lifter moves a local at this width, so a slot is
     /// written and read as the same size
     local_kinds: BTreeMap<u32, Vec<ValueKind>>,
@@ -626,8 +630,25 @@ impl Module {
         self.exports.get(&function).map(String::as_str)
     }
 
+    /// From the local name subsection, or failing that for a parameter, the name its function
+    /// type gives it
     pub fn local_name(&self, function: u32, local: u32) -> Option<&str> {
-        self.locals.get(&function)?.get(&local).map(String::as_str)
+        if let Some(name) = self
+            .locals
+            .get(&function)
+            .and_then(|locals| locals.get(&local))
+        {
+            return Some(name);
+        }
+        let params = self.signature(function)?.params.len() as u32;
+        if local >= params {
+            return None;
+        }
+        let ty = self.function_types.get(&function)?;
+        self.parameter_names
+            .get(ty)?
+            .get(&local)
+            .map(String::as_str)
     }
 
     /// The declared locals, spelled `index: name`; parameters are named through the prototype
@@ -818,8 +839,12 @@ pub fn core_module_spans(image: &[u8]) -> Vec<Range<usize>> {
             continue;
         };
         // The parser does not bounds check that range
-        if unchecked_range.end <= image.len() {
-            spans.push(unchecked_range);
+        if let (Ok(start), Ok(end)) = (
+            usize::try_from(unchecked_range.start),
+            usize::try_from(unchecked_range.end),
+        ) && end <= image.len()
+        {
+            spans.push(start..end);
         }
     }
     spans
@@ -930,6 +955,7 @@ pub fn parse(image: &[u8], base: u64) -> Option<Module> {
                                 signature,
                             },
                         );
+                        module.function_types.insert(next_index, type_index);
                         next_index += 1;
                     }
                 }
@@ -1023,7 +1049,7 @@ pub fn parse(image: &[u8], base: u64) -> Option<Module> {
                 for segment in reader.into_iter().flatten() {
                     module.data.push(DataSpan {
                         start: base + segment.data.as_ptr() as u64 - image.as_ptr() as u64,
-                        end: base + segment.range.end as u64,
+                        end: base + segment.range.end,
                         memory_offset: data_offset(&segment),
                     });
                 }
@@ -1038,10 +1064,10 @@ pub fn parse(image: &[u8], base: u64) -> Option<Module> {
                 defined += 1;
 
                 // A made up signature would have a call read as taking no arguments
-                let Some(Some(signature)) = signatures
-                    .get(ordinal as usize)
-                    .map(|ty| module.types.get(*ty as usize).cloned().flatten())
-                else {
+                let Some(&type_index) = signatures.get(ordinal as usize) else {
+                    continue;
+                };
+                let Some(Some(signature)) = module.types.get(type_index as usize).cloned() else {
                     continue;
                 };
 
@@ -1050,6 +1076,7 @@ pub fn parse(image: &[u8], base: u64) -> Option<Module> {
                     continue;
                 };
                 let index = next_index.saturating_add(ordinal);
+                module.function_types.insert(index, type_index);
 
                 // Parameters are locals too, and are numbered before the declared ones
                 let mut kinds = signature.params.clone();
@@ -1068,9 +1095,9 @@ pub fn parse(image: &[u8], base: u64) -> Option<Module> {
                 module.local_kinds.insert(index, kinds);
 
                 let info = FunctionInfo {
-                    start: base + body.range().start as u64,
-                    entry: base + reader.original_position() as u64,
-                    end: base + body.range().end as u64,
+                    start: base + body.range().start,
+                    entry: base + reader.original_position(),
+                    end: base + body.range().end,
                     signature,
                 };
 
@@ -1235,8 +1262,8 @@ fn section_span(payload: &Payload, base: u64) -> Option<SectionSpan> {
             let data = section.data_offset()..section.range().end;
             return Some(SectionSpan {
                 name: clean(section.name()),
-                start: base + data.start as u64,
-                end: base + data.end as u64,
+                start: base + data.start,
+                end: base + data.end,
                 code: false,
             });
         }
@@ -1245,8 +1272,8 @@ fn section_span(payload: &Payload, base: u64) -> Option<SectionSpan> {
 
     Some(SectionSpan {
         name: name.to_owned(),
-        start: base + range.start as u64,
-        end: base + range.end as u64,
+        start: base + range.start,
+        end: base + range.end,
         code,
     })
 }
@@ -1254,7 +1281,10 @@ fn section_span(payload: &Payload, base: u64) -> Option<SectionSpan> {
 /// The section is advisory, so anything unreadable in it is skipped rather than allowed to spoil
 /// the rest of the module
 fn read_names(data: &[u8], module: &mut Module) {
-    use wasmparser::{BinaryReader, Name, NameSectionReader};
+    use wasmparser::{BinaryReader, IndirectNameMap, Name, NameSectionReader};
+
+    /// Subsection 12 of the extended name section proposal, which `wasmparser` does not know yet
+    const PARAMETER_NAMES: u8 = 12;
 
     let reader = NameSectionReader::new(BinaryReader::new(data, 0));
     for subsection in reader.into_iter().flatten() {
@@ -1265,22 +1295,25 @@ fn read_names(data: &[u8], module: &mut Module) {
                     module.names.insert(naming.index, clean(naming.name));
                 }
             }
-            Name::Local(functions) => {
-                for function in functions.into_iter().flatten() {
-                    let entry = module.locals.entry(function.index).or_default();
-                    for naming in function.names.into_iter().flatten() {
-                        entry.insert(naming.index, clean(naming.name));
-                    }
-                }
-            }
+            Name::Local(functions) => collect_indirect(functions, &mut module.locals),
             Name::Global(names) => collect(names, &mut module.global_names),
             Name::Data(names) => collect(names, &mut module.data_names),
             Name::Memory(names) => collect(names, &mut module.memory_names),
             Name::Table(names) => collect(names, &mut module.table_names),
             Name::Type(names) => collect(names, &mut module.type_names),
             Name::Tag(names) => collect(names, &mut module.tag_names),
-            // A label is a block depth rather than an address, and a field is a GC type, so
-            // neither has anywhere to go here
+            Name::Unknown {
+                ty: PARAMETER_NAMES,
+                data,
+                ..
+            } => {
+                if let Ok(types) = IndirectNameMap::new(BinaryReader::new(data, 0)) {
+                    collect_indirect(types, &mut module.parameter_names);
+                }
+            }
+            // A label is a block depth rather than an address, a field is a GC type, and an
+            // element segment or a tag's parameters have no address either, so none of them has
+            // anywhere to go here
             Name::Label(_) | Name::Field(_) | Name::Element(_) | Name::Unknown { .. } => {}
         }
     }
@@ -1289,6 +1322,15 @@ fn read_names(data: &[u8], module: &mut Module) {
 fn collect(names: wasmparser::NameMap, into: &mut BTreeMap<u32, String>) {
     for naming in names.into_iter().flatten() {
         into.insert(naming.index, clean(naming.name));
+    }
+}
+
+fn collect_indirect(
+    names: wasmparser::IndirectNameMap,
+    into: &mut BTreeMap<u32, BTreeMap<u32, String>>,
+) {
+    for group in names.into_iter().flatten() {
+        collect(group.names, into.entry(group.index).or_default());
     }
 }
 
@@ -1603,6 +1645,39 @@ mod tests {
         );
         assert!(!module.is_named(3));
         assert_eq!(module.export_name(2), Some("run"));
+    }
+
+    #[test]
+    fn a_parameter_falls_back_to_the_name_its_type_gives_it() {
+        // Subsection 12 names parameters 0, 1 and 2 of type 0 x, y and z; the local names cover
+        // only parameter 0 of function 1
+        let image = build(
+            r#"(module
+                 (type (func (param i32 i32)))
+                 (import "env" "f" (func (type 0)))
+                 (func (type 0) (param $a i32) (param i32) (local i64) nop)
+                 (@custom "name" "\0c\0c\01\00\03\00\01x\01\01y\02\01z"))"#,
+        );
+        let module = parse(&image, 0).expect("parses");
+
+        assert_eq!(
+            module.local_name(0, 0),
+            Some("x"),
+            "an import has only its type"
+        );
+        assert_eq!(module.local_name(0, 1), Some("y"));
+        assert_eq!(
+            module.local_name(1, 0),
+            Some("a"),
+            "the local name subsection wins"
+        );
+        assert_eq!(module.local_name(1, 1), Some("y"), "the type fills the gap");
+        assert_eq!(
+            module.local_name(1, 2),
+            None,
+            "a declared local is no parameter, whatever the type says"
+        );
+        assert!(module.local_names_past(1, 2).is_empty());
     }
 
     #[test]

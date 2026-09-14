@@ -45,7 +45,7 @@ fn core_module(file: &Path, image: &[u8], report: &mut Report) {
         if let Payload::CodeSectionEntry(body) = &payload {
             report.functions += 1;
             if let Ok(reader) = body.get_operators_reader() {
-                bodies.push((reader.original_position() as u64, body.range().end as u64));
+                bodies.push((reader.original_position(), body.range().end));
             }
         }
 
@@ -140,9 +140,13 @@ fn function(
     }
 
     // Instructions start after the locals declaration, which is not code
-    let start = reader.original_position() as u64;
-    let end = body.range().end as u64;
-    let Some(code) = image.get(start as usize..end as usize) else {
+    let start = reader.original_position();
+    let end = body.range().end;
+    let code = usize::try_from(start)
+        .ok()
+        .zip(usize::try_from(end).ok())
+        .and_then(|(start, end)| image.get(start..end));
+    let Some(code) = code else {
         report.abandoned += 1;
         return;
     };
@@ -161,7 +165,7 @@ fn function(
 
         // The core caps how many bytes it asks an architecture about, so a `br_table` past that is
         // one no plugin could disassemble and is counted rather than failed
-        if consumed > insn::MAX_INSTR_LEN {
+        if consumed > insn::MAX_INSTR_LEN as u64 {
             report.oversized += 1;
             return;
         }
@@ -170,7 +174,7 @@ fn function(
             report.fail(file, format!("{at:#x}: no decode for {op:?}"));
             return;
         };
-        if decoded.len != consumed {
+        if decoded.len as u64 != consumed {
             report.fail(
                 file,
                 format!(
@@ -189,7 +193,7 @@ fn function(
             .get_control_frame(0)
             .is_some_and(|frame| !frame.unreachable);
         truth_heights.push((
-            at as u64,
+            at,
             reachable.then(|| u64::from(validator.operand_stack_height())),
         ));
 
@@ -208,7 +212,7 @@ fn function(
             report.abandoned += 1;
             return;
         }
-        offset += consumed;
+        offset += decoded.len;
     }
 
     if offset != code.len() {
@@ -254,7 +258,7 @@ fn heights(
 
 fn arity(
     file: &Path,
-    at: usize,
+    at: u64,
     decoded: &insn::Instruction,
     truth: Option<(u32, u32)>,
     report: &mut Report,
@@ -277,7 +281,7 @@ fn arity(
 
 fn stack_effect(
     file: &Path,
-    at: usize,
+    at: u64,
     decoded: &insn::Instruction,
     call: Option<module::Resolved>,
     truth: Option<(u32, u32)>,
@@ -309,7 +313,7 @@ fn stack_effect(
 /// the arities stop lining up almost immediately
 fn call_target(
     file: &Path,
-    at: usize,
+    at: u64,
     op: &Operator,
     truth: Option<(u32, u32)>,
     read: Option<&module::Module>,

@@ -43,7 +43,8 @@ fn function_body(module: &[u8]) -> Option<&[u8]> {
     for payload in Parser::new(0).parse_all(module) {
         if let Ok(Payload::CodeSectionEntry(body)) = payload {
             let range = body.range();
-            return module.get(range.start..range.end);
+            return module
+                .get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?);
         }
     }
 

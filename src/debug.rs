@@ -31,7 +31,7 @@ use crate::{lift, settings, view};
 pub const NAME: &str = "WASM DWARF";
 
 type Slice<'a> = EndianSlice<'a, LittleEndian>;
-type Entry<'a, 'u> = gimli::DebuggingInformationEntry<'a, 'u, Slice<'a>>;
+type Entry<'a> = gimli::DebuggingInformationEntry<Slice<'a>>;
 
 struct WasmDwarf;
 
@@ -182,7 +182,7 @@ impl Import<'_, '_> {
     fn walk(&mut self) {
         let unit = self.unit;
         let mut entries = unit.entries();
-        while let Ok(Some((_, entry))) = entries.next_dfs() {
+        while let Ok(Some(entry)) = entries.next_dfs() {
             match entry.tag() {
                 gimli::DW_TAG_subprogram => self.subprogram(entry),
                 gimli::DW_TAG_variable => self.variable(entry),
@@ -308,10 +308,9 @@ impl Import<'_, '_> {
             return (slots, frame);
         }
 
-        let mut level = 0isize;
         let mut inlined = isize::MAX;
-        while let Ok(Some((delta, child))) = cursor.next_dfs() {
-            level += delta;
+        while let Ok(Some(child)) = cursor.next_dfs() {
+            let level = child.depth();
             if level <= 0 {
                 break;
             }
@@ -553,9 +552,8 @@ impl Import<'_, '_> {
             return found;
         }
 
-        let mut level = 0isize;
-        while let Ok(Some((delta, child))) = cursor.next_dfs() {
-            level += delta;
+        while let Ok(Some(child)) = cursor.next_dfs() {
+            let level = child.depth();
             if level <= 0 {
                 break;
             }
@@ -667,9 +665,8 @@ impl Import<'_, '_> {
         let mut cursor = unit.entries_at_offset(offset).ok()?;
         cursor.next_dfs().ok()?;
 
-        let mut level = 0isize;
-        while let Ok(Some((delta, child))) = cursor.next_dfs() {
-            level += delta;
+        while let Ok(Some(child)) = cursor.next_dfs() {
+            let level = child.depth();
             if level <= 0 {
                 break;
             }
@@ -760,9 +757,8 @@ impl Import<'_, '_> {
         let mut cursor = unit.entries_at_offset(offset).ok()?;
         cursor.next_dfs().ok()?;
 
-        let mut level = 0isize;
-        while let Ok(Some((delta, child))) = cursor.next_dfs() {
-            level += delta;
+        while let Ok(Some(child)) = cursor.next_dfs() {
+            let level = child.depth();
             if level <= 0 {
                 break;
             }
@@ -781,9 +777,9 @@ impl Import<'_, '_> {
         let signed = underlying.as_ref().is_none_or(|at| {
             !matches!(
                 at.attr_value(gimli::DW_AT_encoding),
-                Ok(Some(AttributeValue::Encoding(
+                Some(AttributeValue::Encoding(
                     gimli::DW_ATE_unsigned | gimli::DW_ATE_unsigned_char | gimli::DW_ATE_boolean
-                )))
+                ))
             )
         });
         let body = Type::enumeration(&builder.finalize(), width, signed);
@@ -835,9 +831,8 @@ impl Import<'_, '_> {
         let mut cursor = unit.entries_at_offset(offset).ok()?;
         cursor.next_dfs().ok()?;
 
-        let mut level = 0isize;
-        while let Ok(Some((delta, child))) = cursor.next_dfs() {
-            level += delta;
+        while let Ok(Some(child)) = cursor.next_dfs() {
+            let level = child.depth();
             if level <= 0 {
                 break;
             }
@@ -867,9 +862,8 @@ impl Import<'_, '_> {
         let mut cursor = unit.entries_at_offset(offset).ok()?;
         cursor.next_dfs().ok()?;
 
-        let mut level = 0isize;
-        while let Ok(Some((delta, child))) = cursor.next_dfs() {
-            level += delta;
+        while let Ok(Some(child)) = cursor.next_dfs() {
+            let level = child.depth();
             if level <= 0 {
                 break;
             }
@@ -902,7 +896,7 @@ impl Import<'_, '_> {
 
     fn type_at(&mut self, offset: gimli::UnitOffset, depth: usize) -> Option<Ref<Type>> {
         let entry = self.unit.entry(offset).ok()?;
-        let AttributeValue::UnitRef(target) = entry.attr_value(gimli::DW_AT_type).ok()?? else {
+        let AttributeValue::UnitRef(target) = entry.attr_value(gimli::DW_AT_type)? else {
             return None;
         };
         self.build_type(target, depth + 1)
@@ -931,7 +925,7 @@ impl Import<'_, '_> {
 
     fn linkage_at(&self, offset: gimli::UnitOffset) -> Option<String> {
         let entry = self.unit.entry(offset).ok()?;
-        let attr = entry.attr_value(gimli::DW_AT_linkage_name).ok()??;
+        let attr = entry.attr_value(gimli::DW_AT_linkage_name)?;
         let raw = self.dwarf.attr_string(self.unit, attr).ok()?;
         let name = module::clean(std::str::from_utf8(raw.slice()).ok()?);
         (!name.is_empty()).then_some(name)
@@ -945,7 +939,7 @@ impl Import<'_, '_> {
             let next = [gimli::DW_AT_specification, gimli::DW_AT_abstract_origin]
                 .into_iter()
                 .find_map(|attr| match step.attr_value(attr) {
-                    Ok(Some(AttributeValue::UnitRef(offset))) => Some(offset),
+                    Some(AttributeValue::UnitRef(offset)) => Some(offset),
                     _ => None,
                 });
             match next {
@@ -957,7 +951,7 @@ impl Import<'_, '_> {
     }
 
     fn address(&self, entry: &Entry, attr: gimli::DwAt) -> Option<u64> {
-        let AttributeValue::Addr(address) = entry.attr_value(attr).ok()?? else {
+        let AttributeValue::Addr(address) = entry.attr_value(attr)? else {
             return None;
         };
         (!is_tombstone(address, self.unit.encoding().address_size)).then_some(address)
@@ -972,7 +966,7 @@ enum Where {
 }
 
 fn location(entry: &Entry, size: u8) -> Option<Where> {
-    let AttributeValue::Exprloc(expression) = entry.attr_value(gimli::DW_AT_location).ok()?? else {
+    let AttributeValue::Exprloc(expression) = entry.attr_value(gimli::DW_AT_location)? else {
         return None;
     };
 
@@ -1016,11 +1010,10 @@ impl Scopes {
     fn of(dwarf: &Dwarf<Slice>, unit: &gimli::Unit<Slice>) -> Self {
         let mut spans: Vec<Span> = Vec::new();
         let mut open: Vec<(isize, usize)> = Vec::new();
-        let mut level = 0isize;
         let mut entries = unit.entries();
 
-        while let Ok(Some((delta, entry))) = entries.next_dfs() {
-            level += delta;
+        while let Ok(Some(entry)) = entries.next_dfs() {
+            let level = entry.depth();
             let at = entry.offset().0;
             while let Some(&(depth, index)) = open.last() {
                 if depth < level {
@@ -1094,7 +1087,7 @@ fn base_type(entry: &Entry) -> Option<Ref<Type>> {
     if size == 0 || size > 16 {
         return None;
     }
-    let encoding = match entry.attr_value(gimli::DW_AT_encoding).ok()?? {
+    let encoding = match entry.attr_value(gimli::DW_AT_encoding)? {
         AttributeValue::Encoding(encoding) => encoding,
         _ => return None,
     };
@@ -1113,7 +1106,7 @@ fn reference(class: NamedTypeReferenceClass, name: &str) -> Ref<Type> {
 
 fn type_ref(entry: &Entry) -> Option<gimli::UnitOffset> {
     match entry.attr_value(gimli::DW_AT_type) {
-        Ok(Some(AttributeValue::UnitRef(offset))) => Some(offset),
+        Some(AttributeValue::UnitRef(offset)) => Some(offset),
         _ => None,
     }
 }
@@ -1129,13 +1122,13 @@ fn is_aggregate(tag: gimli::DwTag) -> bool {
 }
 
 fn has_name(entry: &Entry) -> bool {
-    matches!(entry.attr_value(gimli::DW_AT_name), Ok(Some(_)))
+    entry.attr_value(gimli::DW_AT_name).is_some()
 }
 
 fn is_declaration(entry: &Entry) -> bool {
     matches!(
         entry.attr_value(gimli::DW_AT_declaration),
-        Ok(Some(AttributeValue::Flag(true)))
+        Some(AttributeValue::Flag(true))
     )
 }
 
@@ -1149,7 +1142,7 @@ fn is_tombstone(address: u64, size: u8) -> bool {
 }
 
 fn udata(entry: &Entry, attr: gimli::DwAt) -> Option<u64> {
-    let value = entry.attr_value(attr).ok()??;
+    let value = entry.attr_value(attr)?;
     match value {
         AttributeValue::Udata(value) => Some(value),
         AttributeValue::Sdata(value) => u64::try_from(value).ok(),
@@ -1163,7 +1156,7 @@ fn udata(entry: &Entry, attr: gimli::DwAt) -> Option<u64> {
 }
 
 fn constant(entry: &Entry, attr: gimli::DwAt) -> Option<u64> {
-    match entry.attr_value(attr).ok()?? {
+    match entry.attr_value(attr)? {
         AttributeValue::Sdata(value) => Some(value as u64),
         other => udata_of(other),
     }
@@ -1181,7 +1174,7 @@ fn udata_of(value: AttributeValue<Slice>) -> Option<u64> {
 }
 
 fn name_of(dwarf: &Dwarf<Slice>, unit: &gimli::Unit<Slice>, entry: &Entry) -> Option<String> {
-    let attr = entry.attr_value(gimli::DW_AT_name).ok()??;
+    let attr = entry.attr_value(gimli::DW_AT_name)?;
     let raw = dwarf.attr_string(unit, attr).ok()?;
     // A name out of a debug section is no more trustworthy than one out of the module
     let name = module::clean(std::str::from_utf8(raw.slice()).ok()?);

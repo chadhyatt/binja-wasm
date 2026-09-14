@@ -65,20 +65,24 @@ fn main() -> ExitCode {
     let mut report = Report::new(options.limit());
     for file in &files {
         report.files += 1;
-        match corpus::modules_in(file) {
-            Ok(modules) => {
-                for module in modules {
-                    check::module(file, &module, &mut report);
+        let hole = match corpus::contents_of(file) {
+            Ok(contents) => {
+                for module in &contents.modules {
+                    check::module(file, module, &mut report);
                 }
+                contents.hole()
             }
-            // A file the harness cannot read is a hole in the corpus rather than a pass, unless
-            // it is one of the handful known to be unreadable
-            Err(why) => match known_unreadable(file) {
-                Some(reason) => report
-                    .expected_unreadable
-                    .push(format!("{} ({reason})", file.display())),
-                None => report.unreadable.push(format!("{}: {why}", file.display())),
-            },
+            Err(why) => Some(why),
+        };
+        // Anything the harness cannot read is a hole in the corpus rather than a pass, unless it
+        // is one of the handful known to be unreadable
+        match (hole, known_unreadable(file)) {
+            (Some(why), Some(reason)) => report
+                .expected_unreadable
+                .push(format!("{} ({reason}): {why}", file.display())),
+            (Some(why), None) => report.unreadable.push(format!("{}: {why}", file.display())),
+            (None, Some(_)) => report.stale_expectations.push(file.display().to_string()),
+            (None, None) => {}
         }
     }
 
@@ -90,11 +94,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// The `wast` crate dropped the folded syntax of the legacy exception handling proposal, so
-/// `cfg.rs` covers those operators from bytes instead
+/// Forms the `wast` crate cannot parse: it dropped the folded syntax of the legacy exception
+/// handling proposal, so `cfg.rs` covers those operators from bytes instead, and it is behind the
+/// text format on a couple of newer tests
 ///
-/// Listed rather than ignored, so a new hole cannot open quietly
-const KNOWN_UNREADABLE: [(&str, &str); 4] = [
+/// Listed rather than ignored, so a hole can neither open nor close quietly
+const KNOWN_UNREADABLE: [(&str, &str); 6] = [
     ("legacy/rethrow.wast", "legacy exception handling syntax"),
     ("legacy/throw.wast", "legacy exception handling syntax"),
     ("legacy/try_catch.wast", "legacy exception handling syntax"),
@@ -102,6 +107,11 @@ const KNOWN_UNREADABLE: [(&str, &str); 4] = [
         "legacy/try_delegate.wast",
         "legacy exception handling syntax",
     ),
+    (
+        "proposals/extended-name-section/custom/name_annot.wast",
+        "field name annotations",
+    ),
+    ("type-subtyping.wast", "multiple supertypes"),
 ];
 
 fn known_unreadable(path: &Path) -> Option<&'static str> {
