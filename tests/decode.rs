@@ -1,7 +1,7 @@
 //! Whole-decoder behaviour, exercised the way Binary Ninja exercises it: arbitrary bytes with no
 //! promise that any of it is a real instruction
 
-use binja_wasm::insn::{decode, decode_any, Instruction, MAX_INSTR_LEN};
+use binja_wasm::insn::{Instruction, MAX_INSTR_LEN, decode, decode_any};
 use binja_wasm::{asm, cfg, lift};
 
 /// Every input has to come back as a decode or a clean `None`, and the core goes on to ask for the

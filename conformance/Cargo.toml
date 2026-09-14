@@ -1,17 +1,17 @@
 [package]
 name = "conformance"
-version = "0.1.1"
-edition = "2021"
-license = "MIT"
-publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [features]
 default = ["core"]
 core = ["binja_wasm/core", "binaryninjacore-sys/core"]
 
 [dependencies]
-binja_wasm = { path = "..", default-features = false }
-binaryninjacore-sys = { git = "https://github.com/Vector35/binaryninja-api.git", tag = "stable/5.3.9757", default-features = false }
-wasmparser = { version = "0.255.0", features = ["features", "simd", "validate"] }
-wast = "254.0.0"
-wat = "1.254.0"
+binja_wasm.workspace = true
+binaryninjacore-sys.workspace = true
+wasmparser = { workspace = true, default-features = true, features = ["features", "simd", "validate"] }
+wast.workspace = true
+wat = { workspace = true, default-features = true }

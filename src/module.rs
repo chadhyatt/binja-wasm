@@ -9,8 +9,8 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use wasmparser::{Operator, Parser, Payload, TypeRef};
 
-use crate::insn::Arity;
 use crate::ViewId;
+use crate::insn::Arity;
 
 const MAX_LOCALS: usize = 1 << 16;
 
@@ -678,11 +678,7 @@ impl Module {
     }
 
     pub fn pointer_width(&self) -> usize {
-        if self.memory64 {
-            8
-        } else {
-            4
-        }
+        if self.memory64 { 8 } else { 4 }
     }
 
     pub fn global_kind(&self, index: u32) -> Option<ValueKind> {

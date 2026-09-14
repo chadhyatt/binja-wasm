@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import argparse
-import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from versions import ROOT, plugin_metadata
+
 DIST = ROOT / "dist"
 
 TARGETS = [
@@ -59,11 +59,6 @@ def run(command, env=None):
         sys.exit(result.returncode)
 
 
-def versions():
-    declared = json.loads((ROOT / "version.json").read_text())
-    return declared["crate"], declared["api"]
-
-
 def build(target, ref):
     name, triple = target["name"], target["triple"]
     env = target.get("env", {})
@@ -110,7 +105,7 @@ def main():
     )
     args = parser.parse_args()
 
-    version, api = versions()
+    version, api = plugin_metadata(check=True)
     ref = (args.ref or version).replace("/", "_")
 
     wanted = TARGETS

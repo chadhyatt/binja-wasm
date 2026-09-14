@@ -8,10 +8,10 @@ use std::sync::{LazyLock, RwLock};
 
 use wasmparser::{BlockType, Operator};
 
+use crate::ViewId;
 use crate::insn;
 use crate::lift;
 use crate::module::Module;
-use crate::ViewId;
 
 /// Bodies whose operand stack went below empty, by where their code starts
 static UNBALANCED: LazyLock<RwLock<BTreeSet<(ViewId, u64)>>> = LazyLock::new(Default::default);
@@ -237,10 +237,10 @@ impl ControlFlow {
                     leaders.insert(target);
                 }
             }
-            if let Some(next) = self.next_address(*addr) {
-                if self.contains(next) {
-                    leaders.insert(next);
-                }
+            if let Some(next) = self.next_address(*addr)
+                && self.contains(next)
+            {
+                leaders.insert(next);
             }
         }
 

@@ -72,7 +72,7 @@ jobs:
 
       - id: name
         run: |
-          api=$(python -c "import json; print(json.load(open('version.json'))['api'])")
+          api=$(python scripts/versions.py --api)
           echo "release=${{ github.ref_name }} (BN $api)" >> "$GITHUB_OUTPUT"
 
       - uses: softprops/action-gh-release@v2

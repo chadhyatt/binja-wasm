@@ -155,10 +155,6 @@ impl Options {
     }
 
     fn limit(&self) -> usize {
-        if self.all {
-            usize::MAX
-        } else {
-            20
-        }
+        if self.all { usize::MAX } else { 20 }
     }
 }

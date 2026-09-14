@@ -20,6 +20,7 @@ fmt:
     cargo fmt --all
 
 lint:
+    python3 scripts/versions.py --check
     cargo fmt --all --check
     cargo clippy --locked --workspace --all-targets -- -D warnings
 
@@ -41,30 +42,10 @@ doc *ARGS:
 dist *ARGS:
     python3 scripts/dist.py {{ ARGS }}
 
-# Write version.json out to Cargo.toml, conformance/Cargo.toml and plugin.json.
+# Update plugin.json from the workspace version and API tags.
 update-versions:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    field() {
-        sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" version.json
-    }
-    version=$(field crate)
-    api=$(field api)
-    [ -n "$version" ] || { echo "version.json declares no crate version" >&2; exit 1; }
-    [ -n "$api" ] || { echo "version.json declares no api version" >&2; exit 1; }
-    rewrite() {
-        sed "s|$1|$2|" "$3" > "$3.new" && mv "$3.new" "$3"
-    }
-    rewrite '^version = ".*"' "version = \"$version\"" Cargo.toml
-    rewrite '^version = ".*"' "version = \"$version\"" conformance/Cargo.toml
-    rewrite 'tag = "stable/[^"]*"' "tag = \"stable/$api\"" Cargo.toml
-    rewrite 'tag = "stable/[^"]*"' "tag = \"stable/$api\"" conformance/Cargo.toml
-    rewrite '"version": ".*"' "\"version\": \"$version\"" plugin.json
-    # A plugin loads only into a core with a matching ABI, which is the build number alone
-    rewrite '"minimumbinaryninjaversion": [0-9]*' \
-        "\"minimumbinaryninjaversion\": ${api##*.}" plugin.json
+    python3 scripts/versions.py --write
     cargo update --workspace --quiet
-    echo "$version (BN $api)"
 
 [unix]
 install: build

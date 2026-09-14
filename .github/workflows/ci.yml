@@ -14,6 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check plugin metadata
+        run: python3 scripts/versions.py --check
+
       - name: Install toolchain
         run: rustup component add rustfmt clippy
 
@@ -31,20 +34,8 @@ jobs:
       - name: Test
         run: cargo test --locked --no-default-features
 
+      - name: Conformance
+        run: cargo run --locked --release --no-default-features -p conformance -- --all
+
       - name: Build
         run: cargo build --locked --no-default-features --release
-
-  conformance:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libclang-dev
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run
-        run: cargo run --locked --release --no-default-features -p conformance -- --all

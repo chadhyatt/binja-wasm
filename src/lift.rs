@@ -105,16 +105,16 @@ pub fn lift(
     }
     // Calls come first, since a tail call is a terminator too and lifting it as one loses the
     // callee
-    if let Some(Resolved::Call(call)) = resolved {
-        if lift_call(il, model, insn, call) {
-            return;
-        }
+    if let Some(Resolved::Call(call)) = resolved
+        && lift_call(il, model, insn, call)
+    {
+        return;
     }
 
-    if let Some(recovered) = recovered {
-        if lift_terminator(il, model, insn, recovered) {
-            return;
-        }
+    if let Some(recovered) = recovered
+        && lift_terminator(il, model, insn, recovered)
+    {
+        return;
     }
 
     match semantics(insn) {

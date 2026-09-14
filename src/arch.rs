@@ -11,24 +11,26 @@ use binaryninja::architecture::{
     IntrinsicId, Register, RegisterId, RegisterInfo, UnusedFlag, UnusedRegisterStack,
 };
 use binaryninja::basic_block::PendingBasicBlockEdge;
-use binaryninja::binary_view::{BinaryView, BinaryViewExt};
-use binaryninja::calling_convention::{register_calling_convention, CallingConvention};
+use binaryninja::binary_view::BinaryView;
+use binaryninja::calling_convention::{
+    CallingConvention, CoreCallingConvention, register_calling_convention,
+};
 use binaryninja::confidence::Conf;
 use binaryninja::disassembly::{InstructionTextToken, InstructionTextTokenKind};
 use binaryninja::function::Function;
 use binaryninja::low_level_il::LowLevelILMutableFunction;
 use binaryninja::rc::Ref;
 use binaryninja::types::{NameAndType, Type};
-use binaryninja::{architecture, Endianness};
+use binaryninja::{Endianness, architecture};
 
 use wasmparser::Operator;
 
+use crate::ViewId;
 use crate::asm;
 use crate::cfg::{self, Edge, Terminator};
 use crate::insn::{self, Flow, Operand};
 use crate::lift::{self, Model, SLOT};
 use crate::module;
-use crate::ViewId;
 
 pub const NAME: &str = "wasm";
 pub const NAME64: &str = "wasm64";
@@ -193,7 +195,13 @@ fn slot_type() -> Ref<Type> {
 
 /// Wasm passes arguments on the operand stack, so there is nothing here to name registers with,
 /// and saying so beats leaving the core to guess from a register file that means nothing
-struct WasmCallingConvention;
+struct WasmCallingConvention(CoreCallingConvention);
+
+impl AsRef<CoreCallingConvention> for WasmCallingConvention {
+    fn as_ref(&self) -> &CoreCallingConvention {
+        &self.0
+    }
+}
 
 impl CallingConvention for WasmCallingConvention {
     fn caller_saved_registers(&self) -> Vec<RegisterId> {
@@ -444,14 +452,13 @@ impl Architecture for WasmArchitecture {
             return;
         }
 
+        let instruction_data = context.lifter_instruction_data();
         for block in blocks {
             let Some(native) = context.create_basic_block(arch, block.start) else {
                 continue;
             };
             native.set_end(block.end);
 
-            // The core keys instruction data by address, so a whole block at once records it as
-            // one instruction spanning all of it
             let first = flow
                 .instructions
                 .binary_search_by_key(&block.start, |(at, _)| *at)
@@ -461,8 +468,10 @@ impl Architecture for WasmArchitecture {
                     break;
                 }
                 let offset = (at - from) as usize;
-                if let Some(bytes) = code.get(offset..offset + size) {
-                    native.add_instruction_data(bytes);
+                if let Some(bytes) = code.get(offset..offset + size)
+                    && let Some(instruction_data) = &instruction_data
+                {
+                    instruction_data.append(&native, bytes);
                 }
             }
 
@@ -757,6 +766,7 @@ fn operand_tokens(operand: &Operand) -> Vec<(String, InstructionTextTokenKind)> 
         Operand::Index { value, .. } => vec![(
             value.to_string(),
             InstructionTextTokenKind::Integer {
+                operand: None,
                 value: u64::from(*value),
                 size: Some(4),
             },
@@ -764,6 +774,7 @@ fn operand_tokens(operand: &Operand) -> Vec<(String, InstructionTextTokenKind)> 
         Operand::I32(value) => vec![(
             value.to_string(),
             InstructionTextTokenKind::Integer {
+                operand: None,
                 value: *value as u64,
                 size: Some(4),
             },
@@ -771,6 +782,7 @@ fn operand_tokens(operand: &Operand) -> Vec<(String, InstructionTextTokenKind)> 
         Operand::I64(value) => vec![(
             value.to_string(),
             InstructionTextTokenKind::Integer {
+                operand: None,
                 value: *value as u64,
                 size: Some(8),
             },
@@ -793,6 +805,7 @@ fn operand_tokens(operand: &Operand) -> Vec<(String, InstructionTextTokenKind)> 
         Operand::V128(value) => vec![(
             format!("{value:#034x}"),
             InstructionTextTokenKind::Integer {
+                operand: None,
                 value: *value as u64,
                 size: Some(16),
             },
@@ -800,6 +813,7 @@ fn operand_tokens(operand: &Operand) -> Vec<(String, InstructionTextTokenKind)> 
         Operand::Lane(lane) => vec![(
             lane.to_string(),
             InstructionTextTokenKind::Integer {
+                operand: None,
                 value: u64::from(*lane),
                 size: Some(1),
             },
@@ -810,6 +824,7 @@ fn operand_tokens(operand: &Operand) -> Vec<(String, InstructionTextTokenKind)> 
                 (
                     lane.to_string(),
                     InstructionTextTokenKind::Integer {
+                        operand: None,
                         value: u64::from(*lane),
                         size: Some(1),
                     },
@@ -859,6 +874,7 @@ fn operand_tokens(operand: &Operand) -> Vec<(String, InstructionTextTokenKind)> 
                 (
                     label.to_string(),
                     InstructionTextTokenKind::Integer {
+                        operand: None,
                         value: u64::from(*label),
                         size: Some(4),
                     },
@@ -882,11 +898,7 @@ pub fn register() {
 
 /// The architecture a module of this shape belongs to
 pub fn name_for(memory64: bool) -> &'static str {
-    if memory64 {
-        NAME64
-    } else {
-        NAME
-    }
+    if memory64 { NAME64 } else { NAME }
 }
 
 /// Whether `name` is one of this plugin's architectures

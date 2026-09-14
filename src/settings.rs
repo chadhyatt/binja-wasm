@@ -3,7 +3,7 @@ use binaryninja::settings::{QueryOptions, Settings, SettingsScope};
 use binaryninja::workflow::Workflow;
 
 pub fn register() {
-    let settings = Settings::new();
+    let settings = Settings::global();
     settings.register_group("wasm", "WebAssembly");
     settings.register_setting_json(
         "wasm.dwarf.sourceLines",
@@ -18,7 +18,7 @@ pub fn register() {
 }
 
 pub fn source_lines() -> bool {
-    let settings = Settings::new();
+    let settings = Settings::global();
     let key = "wasm.dwarf.sourceLines";
     !settings.contains(key) || settings.get_bool(key)
 }
@@ -30,7 +30,7 @@ pub fn for_load(settings: &Settings, workflow: &str) {
 pub fn for_view(view: &BinaryView, workflow: &str) {
     let options =
         QueryOptions::new_with_view(view).with_scope(SettingsScope::SettingsResourceScope);
-    analysis(&Settings::new(), &options, workflow);
+    analysis(&Settings::global(), &options, workflow);
 }
 
 fn analysis(settings: &Settings, options: &QueryOptions, workflow: &str) {

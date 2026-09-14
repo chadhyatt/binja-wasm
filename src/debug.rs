@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
-use binaryninja::binary_view::{BinaryView, BinaryViewBase, BinaryViewExt};
+use binaryninja::binary_view::{BinaryView, BinaryViewBase};
 use binaryninja::confidence::{Conf, MAX_CONFIDENCE};
 use binaryninja::debuginfo::{
     CustomDebugInfoParser, DebugFunctionInfo, DebugInfo, DebugInfoParser,
@@ -495,7 +495,7 @@ impl Import<'_, '_> {
                 .slot_wide(ty, *kind)
                 .unwrap_or_else(|| view::parameter_type(*kind));
             let at = view::parameter_slot(nth as u32);
-            parameters.push(FunctionParameter::new(ty, name, Some(at)));
+            parameters.push(FunctionParameter::new(ty, name, Some(at.into())));
         }
 
         let pointer = self.module.layout.pointer;
@@ -749,10 +749,10 @@ impl Import<'_, '_> {
             .unwrap_or(4);
         let width = NonZeroUsize::new(width as usize)?;
         let name = self.registered_name(entry, offset);
-        if let Some(name) = &name {
-            if !self.registered.insert(name.clone()) {
-                return Some(reference(NamedTypeReferenceClass::EnumNamedTypeClass, name));
-            }
+        if let Some(name) = &name
+            && !self.registered.insert(name.clone())
+        {
+            return Some(reference(NamedTypeReferenceClass::EnumNamedTypeClass, name));
         }
 
         let unit = self.unit;

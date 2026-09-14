@@ -3,34 +3,31 @@
 //! Maps each section, creates one function per body, and gives each one the name and prototype the
 //! module declares
 //!
-//! `init` never reports failure: a half-built view that returned an error is left in a state the
+//! `initialize` never reports failure: a half-built view that returned an error is left in a state the
 //! next callback aborts on, so anything missing is left out instead
 
 use std::collections::BTreeMap;
 
+use binaryninja::Endianness;
 use binaryninja::architecture::{ArchitectureExt, CoreArchitecture};
 use binaryninja::binary_view::{
-    register_binary_view_event, BinaryView, BinaryViewBase, BinaryViewEventType, BinaryViewExt,
-    Result,
+    BinaryView, BinaryViewBase, BinaryViewEventType, CustomBinaryView, CustomBinaryViewType,
+    register_binary_view_event, register_binary_view_type,
 };
 use binaryninja::confidence::Conf;
-use binaryninja::custom_binary_view::{
-    register_view_type, BinaryViewType, BinaryViewTypeBase, CustomBinaryView, CustomBinaryViewType,
-    CustomView, CustomViewBuilder,
-};
 use binaryninja::data_buffer::DataBuffer;
 use binaryninja::platform::Platform;
 use binaryninja::rc::Ref;
 use binaryninja::section::{SectionBuilder, Semantics};
 use binaryninja::segment::{SegmentBuilder, SegmentFlags};
-use binaryninja::settings::Settings;
+use binaryninja::settings::{Settings, SettingsScope};
 use binaryninja::symbol::{Binding, Symbol, SymbolType};
 use binaryninja::types::{
     FunctionParameter, MemberAccess, MemberScope, QualifiedName, StructureBuilder, Type,
+    ValueLocation,
 };
 use binaryninja::variable::{Variable, VariableSourceType};
-use binaryninja::workflow::{activity, Activity, AnalysisContext, Workflow};
-use binaryninja::Endianness;
+use binaryninja::workflow::{Activity, AnalysisContext, Workflow, activity};
 
 use crate::arch;
 use crate::cfg;
@@ -40,17 +37,23 @@ use crate::settings;
 
 pub const NAME: &str = "WASM";
 
-pub struct WasmViewType {
-    core: BinaryViewType,
-}
+pub struct WasmViewType;
 
-impl AsRef<BinaryViewType> for WasmViewType {
-    fn as_ref(&self) -> &BinaryViewType {
-        &self.core
+impl CustomBinaryViewType for WasmViewType {
+    type CustomBinaryView = WasmView;
+    const NAME: &'static str = NAME;
+    const LONG_NAME: &'static str = "WebAssembly Module";
+
+    fn create_binary_view(&self, data: &BinaryView) -> Result<WasmView, ()> {
+        Ok(WasmView {
+            parent: data.to_owned(),
+            backing: Vec::new(),
+            image: 0,
+            entry: 0,
+            layout: module::Layout::default(),
+        })
     }
-}
 
-impl BinaryViewTypeBase for WasmViewType {
     fn is_valid_for(&self, data: &BinaryView) -> bool {
         let mut header = [0u8; 8];
         if data.read(&mut header, 0) != header.len() || header[..4] != *b"\0asm" {
@@ -74,37 +77,29 @@ impl BinaryViewTypeBase for WasmViewType {
     /// Half of what turns it off, [`choose_analysis`] being the other, since this key is not in
     /// every core's load settings schema
     fn load_settings_for_data(&self, data: &BinaryView) -> Option<Ref<Settings>> {
-        let settings = self.default_load_settings_for_data(data)?;
+        let settings = Settings::new_with_id(&format!("WASM.loadSettings.{}", arch::view_id(data)));
+        if !settings.deserialize_schema_with_scope(
+            &Settings::global().serialize_schema(),
+            SettingsScope::SettingsResourceScope,
+        ) {
+            tracing::error!("wasm view: could not initialize load settings");
+            return None;
+        }
+        settings.set_resource_id(NAME);
         settings::for_load(&settings, WORKFLOW);
         Some(settings)
     }
 }
 
-impl CustomBinaryViewType for WasmViewType {
-    fn create_custom_view<'builder>(
-        &self,
-        data: &BinaryView,
-        builder: CustomViewBuilder<'builder, Self>,
-    ) -> Result<CustomView<'builder>> {
-        builder.create::<WasmView>(data, ())
-    }
-}
-
 pub struct WasmView {
-    handle: Ref<BinaryView>,
-    /// The core falls back to `read` until the segment map is activated, which is after `init`
+    parent: Ref<BinaryView>,
+    /// The core falls back to `read` until the segment map is activated, which is after `initialize`
     /// returns, and without this every address reads as empty there
     backing: Vec<(u64, u64, Option<u64>)>,
     /// Bytes of the file itself
     image: u64,
     entry: u64,
     layout: module::Layout,
-}
-
-impl AsRef<BinaryView> for WasmView {
-    fn as_ref(&self) -> &BinaryView {
-        &self.handle
-    }
 }
 
 impl BinaryViewBase for WasmView {
@@ -127,10 +122,6 @@ impl BinaryViewBase for WasmView {
 
     /// Ranges the file does not fill, such as the globals, read as zero, which is what they hold
     fn read(&self, buf: &mut [u8], offset: u64) -> usize {
-        let Some(parent) = self.handle.parent_view() else {
-            return 0;
-        };
-
         let Some((start, end, file)) = self
             .backing
             .iter()
@@ -141,7 +132,9 @@ impl BinaryViewBase for WasmView {
 
         let available = (end - offset).min(buf.len() as u64) as usize;
         match file {
-            Some(file) => parent.read(&mut buf[..available], file + (offset - start)),
+            Some(file) => self
+                .parent
+                .read(&mut buf[..available], file + (offset - start)),
             None => {
                 buf[..available].fill(0);
                 available
@@ -154,26 +147,10 @@ impl BinaryViewBase for WasmView {
     }
 }
 
-unsafe impl CustomBinaryView for WasmView {
-    type Args = ();
-
-    fn new(handle: &BinaryView, _args: &Self::Args) -> Result<Self> {
-        Ok(Self {
-            handle: handle.to_owned(),
-            backing: Vec::new(),
-            image: 0,
-            entry: 0,
-            layout: module::Layout::default(),
-        })
-    }
-
-    fn init(&mut self, _args: Self::Args) -> Result<()> {
-        let Some(parent) = self.handle.parent_view() else {
-            return Ok(());
-        };
-
-        self.image = parent.len().min(module::MAX_IMAGE_LEN as u64);
-        let image = parent.read_vec(0, self.image as usize);
+impl CustomBinaryView for WasmView {
+    fn initialize(&mut self, view: &BinaryView) -> bool {
+        self.image = self.parent.len().min(module::MAX_IMAGE_LEN as u64);
+        let image = self.parent.read_vec(0, self.image as usize);
 
         // A component's modules each number their functions from zero, so they are read separately
         // and the one with the most code owns the regions there is only one of
@@ -183,12 +160,12 @@ unsafe impl CustomBinaryView for WasmView {
         let mut modules = module::parse_all(&image, 0);
         // The core builds a view of the same file more than once, so the first layout a file gets
         // is the one it keeps: a second leaves the first view's modules at addresses nothing backs
-        let view = arch::view_id(&self.handle);
-        self.layout = module::layout(view).unwrap_or_else(|| self.place(&modules));
+        let id = arch::view_id(view);
+        self.layout = module::layout(id).unwrap_or_else(|| self.place(&modules));
         for module in &mut modules {
             module.place(self.layout);
         }
-        module::install_layout(view, self.layout);
+        module::install_layout(id, self.layout);
         tracing::info!(
             "wasm view: memory 0..{:#x}, file {:#x}..{:#x}, {} globals at {:#x}, {} imports at \
              {:#x}, {} bit pointers",
@@ -218,29 +195,29 @@ unsafe impl CustomBinaryView for WasmView {
             tracing::warn!("wasm view: no functions or imports found, mapping the file only");
             let file = self.layout.file_base..self.layout.file_address(self.image);
             self.backing.push((file.start, file.end, Some(0)));
-            self.handle.add_segment(
+            view.add_segment(
                 SegmentBuilder::new(file)
                     .parent_backing(0..self.image)
                     .flags(SegmentFlags::new().readable(true).contains_data(true))
                     .is_auto(true),
             );
-            return Ok(());
+            return true;
         };
 
         // Where the file backs each address is worked out either way, since `read` answers from it
         // until the segment map is active; only handing the core the segments a second time has to
         // be skipped, since they land on top of the ones already there
-        let place = self.handle.segments().iter().count() == 0;
+        let place = view.segments().iter().count() == 0;
         let (file_segments, memory_segments, extra_segments) =
-            self.map(&modules, &modules[primary], place);
+            self.map(view, &modules, &modules[primary], place);
         self.backing.sort_by_key(|(start, _, _)| *start);
         let mapped = file_segments + memory_segments + extra_segments;
-        let annotated = self.annotate(&modules, &modules[primary], place);
+        let annotated = self.annotate(view, &modules, &modules[primary], place);
 
         // Adding a segment or a section reports nothing, so counting what landed is the only way
         // to notice one the core rejected
-        let segments = self.handle.segments().iter().count();
-        let sections = self.handle.sections().iter().count();
+        let segments = view.segments().iter().count();
+        let sections = view.sections().iter().count();
         if place && (segments != mapped || sections != annotated) {
             tracing::warn!(
                 "wasm view: {segments} of {mapped} segments accepted ({file_segments} for the \
@@ -253,36 +230,34 @@ unsafe impl CustomBinaryView for WasmView {
         let wanted = arch::name_for(self.layout.pointer == 8);
         let Some(arch) = CoreArchitecture::by_name(wanted) else {
             tracing::error!("wasm view: the {wanted} architecture is not registered");
-            return Ok(());
+            return true;
         };
-        if platform_for(&arch).is_none() {
+        let Some(platform) = platform_for(&arch) else {
             tracing::error!("wasm view: the {wanted} architecture has no platform");
-            return Ok(());
-        }
-        self.handle.set_default_arch(&arch);
-        self.handle
-            .set_default_platform(&platform_for(&arch).expect("checked above"));
+            return true;
+        };
+        view.set_default_arch(&arch);
+        view.set_default_platform(&platform);
 
-        self.recover(&modules, &image);
+        self.recover(view, &modules, &image);
         self.entry = entry_of(&modules[primary]).unwrap_or(0);
 
         // Before any function exists, since creating one starts analysis and `analyze_basic_blocks`
         // reads the body's extent from here, without which the walk runs through the functions
         // that follow and the core merges them into one
-        let view = arch::view_id(&self.handle);
         let installed: Vec<_> = modules
             .into_iter()
             .map(|module| {
                 let (base, end) = (module.base, module.end);
-                module::install(view, base, end, module)
+                module::install(id, base, end, module)
             })
             .collect();
 
         // No functions and no entry point here: creating either starts analysis, analysis reads the
-        // view, and a read while `init` is still running aborts the process
+        // view, and a read while `initialize` is still running aborts the process
         drop(installed);
 
-        Ok(())
+        true
     }
 }
 
@@ -318,7 +293,13 @@ impl WasmView {
 
     /// Only the code section is executable, or a type section disassembles as a run of `try` and
     /// `br_table`
-    fn map(&mut self, modules: &[Module], primary: &Module, place: bool) -> (usize, usize, usize) {
+    fn map(
+        &mut self,
+        view: &BinaryView,
+        modules: &[Module],
+        primary: &Module,
+        place: bool,
+    ) -> (usize, usize, usize) {
         let mut added = 0usize;
         // Every module's sections, so a component's nested code is executable too
         let spans: Vec<(u64, u64, bool)> = modules
@@ -327,13 +308,13 @@ impl WasmView {
             .filter(|section| section.start < section.end)
             .map(|section| (section.start, section.end, section.code))
             .collect();
-        self.handle.begin_bulk_add_segments();
+        view.begin_bulk_add_segments();
 
         // Memory goes first, because what it backs is what the file image leaves out: mapping
         // those bytes in both places made every string appear twice, the file copy unable to carry
         // a reference; it is taken from what memory mapped rather than what the module declares, so
         // a segment memory had no room for keeps its bytes in the file
-        let (memory_segments, mut initialisers) = self.map_memory(primary, place);
+        let (memory_segments, mut initialisers) = self.map_memory(view, primary, place);
         initialisers.sort_unstable();
 
         let covering = covering(
@@ -353,7 +334,7 @@ impl WasmView {
                 .contains_data(!code);
             added += 1;
             if place {
-                self.handle.add_segment(
+                view.add_segment(
                     SegmentBuilder::new(start..end)
                         .parent_backing(offset..offset + (end - start))
                         .flags(flags)
@@ -381,7 +362,7 @@ impl WasmView {
             ));
             added += 1;
             if place {
-                self.handle.add_segment(
+                view.add_segment(
                     SegmentBuilder::new(
                         self.layout.global_base
                             ..self.layout.global_base + globals * module::GLOBAL_STRIDE,
@@ -408,7 +389,7 @@ impl WasmView {
                 .push((self.layout.table_base, self.layout.table_end(), None));
             added += 1;
             if place {
-                self.handle.memory_map().add_data_memory_region(
+                view.memory_map().add_data_memory_region(
                     "wasm table",
                     self.layout.table_base,
                     &DataBuffer::new(&self.table_image(modules)),
@@ -434,7 +415,7 @@ impl WasmView {
             ));
             added += 1;
             if place {
-                self.handle.add_segment(
+                view.add_segment(
                     SegmentBuilder::new(self.layout.import_base..self.layout.import_base + stubs)
                         .parent_backing(0..stubs)
                         .flags(
@@ -447,7 +428,7 @@ impl WasmView {
                 );
             }
         }
-        self.handle.end_bulk_add_segments();
+        view.end_bulk_add_segments();
         (file_segments, memory_segments, added)
     }
 
@@ -481,7 +462,12 @@ impl WasmView {
 
     /// The code addresses memory rather than the file, so a string only resolves if its bytes are
     /// readable at the address the load computes
-    fn map_memory(&mut self, module: &Module, place: bool) -> (usize, Vec<(u64, u64)>) {
+    fn map_memory(
+        &mut self,
+        view: &BinaryView,
+        module: &Module,
+        place: bool,
+    ) -> (usize, Vec<(u64, u64)>) {
         let mut added = 0usize;
         let mut backed: Vec<(u64, u64)> = Vec::new();
         let mut placed: Vec<(u64, u64, u64)> = module
@@ -523,12 +509,12 @@ impl WasmView {
             }
             added += 1;
             if place {
-                self.handle.add_segment(segment);
+                view.add_segment(segment);
             }
         }
 
         if place {
-            self.handle.add_section(
+            view.add_section(
                 SectionBuilder::new(
                     "memory".to_string(),
                     self.layout.memory_address(0)..self.layout.memory_address(end),
@@ -542,7 +528,13 @@ impl WasmView {
     }
 
     /// Also what puts a compiler's DWARF where the core can see it
-    fn annotate(&self, modules: &[Module], primary: &Module, place: bool) -> usize {
+    fn annotate(
+        &self,
+        view: &BinaryView,
+        modules: &[Module],
+        primary: &Module,
+        place: bool,
+    ) -> usize {
         let mut added = 0usize;
         // The core keys sections by name, and two custom sections may share one, so each gets a
         // name of its own rather than replacing the last
@@ -573,7 +565,7 @@ impl WasmView {
             };
             added += 1;
             if place {
-                self.handle.add_section(
+                view.add_section(
                     SectionBuilder::new(name, section.start..section.end)
                         .semantics(semantics)
                         .is_auto(true),
@@ -589,7 +581,7 @@ impl WasmView {
         if imports != 0 {
             added += 1;
             if place {
-                self.handle.add_section(
+                view.add_section(
                     SectionBuilder::new(
                         "extern".to_string(),
                         self.layout.import_base
@@ -613,7 +605,7 @@ impl WasmView {
             let at = span
                 .memory_offset
                 .map_or(span.start, |at| self.layout.memory_address(at));
-            self.handle.define_auto_symbol(
+            view.define_auto_symbol(
                 &Symbol::builder(SymbolType::Data, &name, at)
                     .short_name(name)
                     .create(),
@@ -625,7 +617,7 @@ impl WasmView {
         let table = primary.table_entries().count();
         if table != 0 {
             added += 1;
-            self.handle.add_section(
+            view.add_section(
                 SectionBuilder::new(
                     "table slots".to_string(),
                     self.layout.table_base..self.layout.table_end(),
@@ -637,13 +629,13 @@ impl WasmView {
         for (slot, function) in primary.table_entries() {
             let at = self.layout.table_address(slot);
             let name = format!("table[{slot}] {}", primary.name_of(function));
-            self.handle.define_auto_symbol(
+            view.define_auto_symbol(
                 &Symbol::builder(SymbolType::Data, &name, at)
                     .short_name(name)
                     .create(),
             );
             if let Some(entry) = primary.entry(function) {
-                self.handle.set_comment_at(
+                view.set_comment_at(
                     at,
                     &format!("wasm: call_indirect {slot} goes to {entry:#x}"),
                 );
@@ -655,11 +647,11 @@ impl WasmView {
             let ty = value_type(global.kind, self.layout.pointer);
             // A `v128` is wider than the slot the region gives it, and would bury the next global
             if global.kind.size() as u64 <= module::GLOBAL_STRIDE {
-                self.handle.define_auto_data_var(address, ty.as_ref());
+                view.define_auto_data_var(address, ty.as_ref());
             }
 
             let name = primary.global_name(index);
-            self.handle.define_auto_symbol(
+            view.define_auto_symbol(
                 &Symbol::builder(SymbolType::Data, &name, address)
                     .short_name(name)
                     .create(),
@@ -671,8 +663,8 @@ impl WasmView {
 
     /// A branch names a label rather than an address, so doing this where every body is known is
     /// what gives `instruction_info` a real answer by the time the core asks
-    fn recover(&self, modules: &[Module], image: &[u8]) {
-        let view = arch::view_id(&self.handle);
+    fn recover(&self, view: &BinaryView, modules: &[Module], image: &[u8]) {
+        let id = arch::view_id(view);
         let mut unreadable = 0usize;
         let mut unbalanced = 0usize;
 
@@ -688,10 +680,10 @@ impl WasmView {
                 };
                 let flow = cfg::recover(code, info.entry, Some(module));
                 if flow.underflow {
-                    cfg::note_unbalanced(view, info.entry);
+                    cfg::note_unbalanced(id, info.entry);
                     unbalanced += 1;
                 }
-                cfg::install(view, &flow);
+                cfg::install(id, &flow);
             }
         }
 
@@ -948,8 +940,8 @@ fn bind_parameters(function: &binaryninja::function::Function, signature: &Signa
     if params == 0 {
         return;
     }
-    let slots: Vec<Variable> = (0..params).map(parameter_slot).collect();
-    function.set_user_parameter_variables(slots, u8::MAX);
+    let slots = (0..params).map(|nth| ValueLocation::from(parameter_slot(nth)));
+    function.set_user_parameter_locations(slots, u8::MAX);
 }
 
 /// Multi-value returns have no single type to be, so they become a struct registered under the
@@ -972,7 +964,7 @@ fn prototype(
             // Stated even though the core drops it, since where it survives it agrees with the
             // frame the caller built
             let at = parameter_slot(nth as u32);
-            FunctionParameter::new(parameter_type(*kind), name, Some(at))
+            FunctionParameter::new(parameter_type(*kind), name, Some(at.into()))
         })
         .collect();
 
@@ -1288,7 +1280,7 @@ pub(crate) fn invented_at(view: crate::ViewId, start: u64) -> bool {
 
 pub fn register() {
     register_workflow();
-    register_view_type(NAME, "WebAssembly Module", |core| WasmViewType { core });
+    register_binary_view_type(WasmViewType);
     register_binary_view_event(
         BinaryViewEventType::BinaryViewFinalizationEvent,
         on_finalized,

@@ -5,8 +5,8 @@ use std::sync::OnceLock;
 
 use wasmparser::{
     AbstractHeapType, BinaryReader, BlockType, BrTable, FrameKind, FrameStack, HeapType, Ieee32,
-    Ieee64, MemArg, Operator, Ordering, RefType, ResumeTable, TryTable, UnpackedIndex, ValType,
-    VisitOperator, VisitSimdOperator, V128,
+    Ieee64, MemArg, Operator, Ordering, RefType, ResumeTable, TryTable, UnpackedIndex, V128,
+    ValType, VisitOperator, VisitSimdOperator,
 };
 
 /// The longest instruction the core will take, so a `br_table` past around 250 entries cannot be
@@ -369,11 +369,7 @@ fn nan_payload(is_nan: bool, payload: u64, canonical: u64) -> Option<String> {
 }
 
 fn sign_of(negative: bool) -> &'static str {
-    if negative {
-        "-"
-    } else {
-        ""
-    }
+    if negative { "-" } else { "" }
 }
 
 /// Operators whose visitor name carries more than the text format spells out
