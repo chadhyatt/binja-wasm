@@ -4,13 +4,14 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use wasmparser::{
-    AbstractHeapType, BinaryReader, BlockType, BrTable, FrameKind, FrameStack, HeapType, Ieee32,
-    Ieee64, MemArg, Operator, Ordering, RefType, ResumeTable, TryTable, UnpackedIndex, V128,
-    ValType, VisitOperator, VisitSimdOperator,
+    AbstractHeapType, BinaryReader, BlockType, BrTable, Catch, FrameKind, FrameStack, Handle,
+    HeapType, Ieee32, Ieee64, MemArg, Operator, Ordering, RefType, ResumeTable, TryTable,
+    UnpackedIndex, V128, ValType, VisitOperator, VisitSimdOperator,
 };
 
-/// The longest instruction the core will take, so a `br_table` past around 250 entries cannot be
-/// one instruction to any plugin and decodes as invalid rather than truncating
+/// The most the core hands over for one instruction's text and info, so there a `br_table` past
+/// around 250 entries is invalid rather than truncated; analysis and lifting read whole bodies
+/// and decode it with [`decode_any`]
 pub const MAX_INSTR_LEN: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,8 +49,8 @@ pub fn decode(data: &[u8]) -> Option<Instruction<'_>> {
     decode_any(data).filter(|insn| insn.len <= MAX_INSTR_LEN)
 }
 
-/// Uncapped, unlike [`decode`]: analysis needs only the operator and its length, and giving up at
-/// an oversized `br_table` would cost the rest of the body its control flow
+/// Uncapped, unlike [`decode`], for the callers that have the whole body: giving up at an
+/// oversized `br_table` would cost the rest of it its control flow
 pub fn decode_any(data: &[u8]) -> Option<Instruction<'_>> {
     // Some operators are legal only inside a particular block, and disassembly starts at an
     // arbitrary address; between these two frames every operator decodes
@@ -131,14 +132,70 @@ impl Flow {
     pub fn falls_through(self) -> bool {
         !matches!(
             self,
-            Flow::Trap | Flow::Return | Flow::Branch | Flow::IndirectBranch | Flow::TailCall
+            Flow::Trap
+                | Flow::Return
+                | Flow::Branch
+                | Flow::IndirectBranch
+                | Flow::TailCall
+                | Flow::Arm
         )
+    }
+}
+
+pub fn raises(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::Call { .. }
+            | Operator::CallIndirect { .. }
+            | Operator::CallRef { .. }
+            | Operator::Suspend { .. }
+            | Operator::Resume { .. }
+            | Operator::ResumeThrow { .. }
+            | Operator::ResumeThrowRef { .. }
+            | Operator::Switch { .. }
+            | Operator::Throw { .. }
+            | Operator::ThrowRef
+            | Operator::Rethrow { .. }
+    )
+}
+
+pub fn conditional_label(op: &Operator) -> Option<u32> {
+    match *op {
+        Operator::BrIf { relative_depth }
+        | Operator::BrOnNull { relative_depth }
+        | Operator::BrOnNonNull { relative_depth }
+        | Operator::BrOnCast { relative_depth, .. }
+        | Operator::BrOnCastFail { relative_depth, .. }
+        | Operator::BrOnCastDescEq { relative_depth, .. }
+        | Operator::BrOnCastDescEqFail { relative_depth, .. } => Some(relative_depth),
+        _ => None,
+    }
+}
+
+pub fn resume_table<'a>(op: &'a Operator) -> Option<&'a ResumeTable> {
+    match op {
+        Operator::Resume { resume_table, .. }
+        | Operator::ResumeThrow { resume_table, .. }
+        | Operator::ResumeThrowRef { resume_table, .. } => Some(resume_table),
+        _ => None,
+    }
+}
+
+pub fn catch_label(catch: &Catch) -> u32 {
+    match *catch {
+        Catch::One { label, .. }
+        | Catch::OneRef { label, .. }
+        | Catch::All { label }
+        | Catch::AllRef { label } => label,
     }
 }
 
 pub fn flow(op: &Operator) -> Flow {
     match op {
-        Operator::Unreachable | Operator::Throw { .. } | Operator::ThrowRef => Flow::Trap,
+        Operator::Unreachable
+        | Operator::Throw { .. }
+        | Operator::ThrowRef
+        | Operator::Rethrow { .. } => Flow::Trap,
         Operator::Block { .. }
         | Operator::Loop { .. }
         | Operator::If { .. }
@@ -146,14 +203,8 @@ pub fn flow(op: &Operator) -> Flow {
         | Operator::TryTable { .. } => Flow::BlockStart,
         Operator::End | Operator::Delegate { .. } => Flow::BlockEnd,
         Operator::Else | Operator::Catch { .. } | Operator::CatchAll => Flow::Arm,
-        Operator::Br { .. } | Operator::Rethrow { .. } => Flow::Branch,
-        Operator::BrIf { .. }
-        | Operator::BrOnNull { .. }
-        | Operator::BrOnNonNull { .. }
-        | Operator::BrOnCast { .. }
-        | Operator::BrOnCastFail { .. }
-        | Operator::BrOnCastDescEq { .. }
-        | Operator::BrOnCastDescEqFail { .. } => Flow::ConditionalBranch,
+        Operator::Br { .. } => Flow::Branch,
+        op if conditional_label(op).is_some() => Flow::ConditionalBranch,
         Operator::BrTable { .. } => Flow::IndirectBranch,
         Operator::Return => Flow::Return,
         Operator::Call { .. } => Flow::Call,
@@ -196,14 +247,24 @@ pub enum Operand {
     Table(String),
 }
 
+type ImmediateTable = Vec<Vec<(&'static str, &'static [&'static str])>>;
+
+struct Immediates<'a>(std::marker::PhantomData<&'a ()>);
+
 /// Generated from the operator list `wasmparser` exposes, so new proposals arrive with the crate
 macro_rules! define_operator_table {
     ($( @$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident (arity $($arity:tt)*) )*) => {
-        /// A position in this list is an operator's stable identity
+        /// An operator's stable identity is its name here, hashed by [`stable_id`]
         static VISITORS: &[&str] = &[$(stringify!($visit)),*];
 
         /// Indexed alongside [`VISITORS`]
         static ARITIES: &[Option<Arity>] = &[$(define_operator_table!(@arity $($arity)*)),*];
+
+        impl<'a> Immediates<'a> {
+            fn table() -> ImmediateTable {
+                vec![$(vec![$($((stringify!($arg), <$argty as Payload>::INPUTS)),*)?]),*]
+            }
+        }
 
         fn visitor_name(op: &Operator) -> Option<&'static str> {
             match op {
@@ -216,16 +277,43 @@ macro_rules! define_operator_table {
             Some(wat_name(visitor_name(op)?))
         }
 
-        /// Every operand an operator carries, in the order the text format writes them
-        pub fn operands(op: &Operator) -> Vec<Operand> {
-            let mut operands = match op {
+        fn encoded_operands(op: &Operator) -> Vec<Operand> {
+            match op {
                 $(
                     Operator::$op $({ $($arg),* })? => vec![
                         $($(Payload::operand($arg, stringify!($arg))),*)?
                     ],
                 )*
                 _ => Vec::new(),
-            };
+            }
+        }
+
+        pub fn memarg(op: &Operator) -> Option<MemArg> {
+            match op {
+                $(
+                    Operator::$op $({ $($arg),* })? => {
+                        None $($(.or_else(|| Payload::memarg($arg)))*)?
+                    }
+                )*
+                _ => None,
+            }
+        }
+
+        pub fn immediates(op: &Operator) -> Vec<u64> {
+            match op {
+                $(
+                    Operator::$op $({ $($arg),* })? => {
+                        let values: Vec<Vec<u64>> = vec![$($(Payload::values($arg)),*)?];
+                        values.concat()
+                    }
+                )*
+                _ => Vec::new(),
+            }
+        }
+
+        /// Every operand an operator carries, in the order the text format writes them
+        pub fn operands(op: &Operator) -> Vec<Operand> {
+            let mut operands = encoded_operands(op);
             text_format_order(&mut operands);
             reference_type_spelling(op, &mut operands);
             operands
@@ -245,24 +333,36 @@ macro_rules! define_operator_table {
 
 wasmparser::for_each_operator!(define_operator_table);
 
-pub fn operator_count() -> usize {
-    VISITORS.len()
+/// A hash of the operator's name rather than its position in `wasmparser`'s list, which moves when
+/// a release adds operators, so an intrinsic id saved in a database keeps meaning the same thing
+pub fn operator_id(op: &Operator) -> Option<u32> {
+    visitor_name(op).map(stable_id)
 }
 
-/// The operator's position in `wasmparser`'s own list, so an intrinsic id saved in a database
-/// still means the same thing when the database is reopened
-pub fn operator_id(op: &Operator) -> Option<u32> {
-    static BY_NAME: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
+pub fn operator_ids() -> impl Iterator<Item = u32> {
+    VISITORS.iter().map(|name| stable_id(name))
+}
 
-    let by_name = BY_NAME.get_or_init(|| {
+pub const fn stable_id(name: &str) -> u32 {
+    let bytes = name.as_bytes();
+    let mut hash: u32 = 0x811c_9dc5;
+    let mut at = 0;
+    while at < bytes.len() {
+        hash = (hash ^ bytes[at] as u32).wrapping_mul(0x0100_0193);
+        at += 1;
+    }
+    hash
+}
+
+fn by_id() -> &'static HashMap<u32, usize> {
+    static BY_ID: OnceLock<HashMap<u32, usize>> = OnceLock::new();
+    BY_ID.get_or_init(|| {
         VISITORS
             .iter()
             .enumerate()
-            .map(|(index, name)| (*name, index as u32))
+            .map(|(index, name)| (stable_id(name), index))
             .collect()
-    });
-
-    by_name.get(visitor_name(op)?).copied()
+    })
 }
 
 /// The text format writes the space first, the encoding what it selects. Stable, so `memory.copy`
@@ -288,8 +388,12 @@ fn text_format_order(operands: &mut [Operand]) {
 /// Nullability is in the opcode for these, and the text format writes it on the operand
 fn reference_type_spelling(op: &Operator, operands: &mut [Operand]) {
     let nullable = match op {
-        Operator::RefTestNullable { .. } | Operator::RefCastNullable { .. } => "null ",
-        Operator::RefTestNonNull { .. } | Operator::RefCastNonNull { .. } => "",
+        Operator::RefTestNullable { .. }
+        | Operator::RefCastNullable { .. }
+        | Operator::RefCastDescEqNullable { .. } => "null ",
+        Operator::RefTestNonNull { .. }
+        | Operator::RefCastNonNull { .. }
+        | Operator::RefCastDescEqNonNull { .. } => "",
         _ => return,
     };
     if let Some(Operand::Type(ty)) = operands.first_mut() {
@@ -298,11 +402,22 @@ fn reference_type_spelling(op: &Operator, operands: &mut [Operand]) {
 }
 
 pub fn operator_name(id: u32) -> Option<String> {
-    VISITORS.get(id as usize).map(|visit| wat_name(visit))
+    by_id().get(&id).map(|index| wat_name(VISITORS[*index]))
 }
 
 pub fn operator_arity(id: u32) -> Option<Arity> {
-    ARITIES.get(id as usize).copied().flatten()
+    ARITIES.get(*by_id().get(&id)?).copied().flatten()
+}
+
+pub fn operator_immediates(id: u32) -> Vec<String> {
+    static IMMEDIATES: OnceLock<ImmediateTable> = OnceLock::new();
+    let Some(index) = by_id().get(&id) else {
+        return Vec::new();
+    };
+    IMMEDIATES.get_or_init(Immediates::table)[*index]
+        .iter()
+        .flat_map(|(name, inputs)| inputs.iter().map(move |suffix| format!("{name}{suffix}")))
+        .collect()
 }
 
 /// The two differ only in where the namespace separators fall, so `visit_i32_atomic_rmw8_add` is
@@ -392,21 +507,47 @@ const NAMESPACES: &[&str] = &[
 const RMW_WIDTHS: &[&str] = &["rmw", "rmw8", "rmw16", "rmw32"];
 
 trait Payload {
+    const INPUTS: &'static [&'static str] = &[];
+
     fn operand(&self, field: &'static str) -> Operand;
+
+    fn values(&self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    fn memarg(&self) -> Option<MemArg> {
+        None
+    }
+}
+
+fn halves(value: u128) -> Vec<u64> {
+    vec![value as u64, (value >> 64) as u64]
 }
 
 impl Payload for u32 {
+    const INPUTS: &'static [&'static str] = &[""];
+
     fn operand(&self, field: &'static str) -> Operand {
         Operand::Index {
             field,
             value: *self,
         }
     }
+
+    fn values(&self) -> Vec<u64> {
+        vec![u64::from(*self)]
+    }
 }
 
 impl Payload for u8 {
+    const INPUTS: &'static [&'static str] = &[""];
+
     fn operand(&self, _field: &'static str) -> Operand {
         Operand::Lane(*self)
+    }
+
+    fn values(&self) -> Vec<u64> {
+        vec![u64::from(*self)]
     }
 }
 
@@ -435,14 +576,26 @@ impl Payload for Ieee64 {
 }
 
 impl Payload for V128 {
+    const INPUTS: &'static [&'static str] = &["_low", "_high"];
+
     fn operand(&self, _field: &'static str) -> Operand {
         Operand::V128(u128::from_le_bytes(*self.bytes()))
+    }
+
+    fn values(&self) -> Vec<u64> {
+        halves(u128::from_le_bytes(*self.bytes()))
     }
 }
 
 impl Payload for [u8; 16] {
+    const INPUTS: &'static [&'static str] = &["_low", "_high"];
+
     fn operand(&self, _field: &'static str) -> Operand {
         Operand::Lanes(*self)
+    }
+
+    fn values(&self) -> Vec<u64> {
+        halves(u128::from_le_bytes(*self))
     }
 }
 
@@ -454,15 +607,63 @@ impl Payload for MemArg {
             memory: self.memory,
         }
     }
+
+    fn memarg(&self) -> Option<MemArg> {
+        Some(*self)
+    }
 }
 
 impl Payload for BlockType {
     fn operand(&self, _field: &'static str) -> Operand {
-        Operand::BlockType(match self {
-            BlockType::Empty => None,
-            BlockType::Type(ty) => Some(format!("(result {ty})")),
-            BlockType::FuncType(index) => Some(format!("(type {index})")),
-        })
+        Operand::BlockType(block_type_text(self))
+    }
+}
+
+fn block_type_text(ty: &BlockType) -> Option<String> {
+    match ty {
+        BlockType::Empty => None,
+        BlockType::Type(ty) => Some(format!("(result {})", val_type_text(ty))),
+        BlockType::FuncType(index) => Some(format!("(type {index})")),
+    }
+}
+
+pub fn val_type_text(ty: &ValType) -> String {
+    match ty {
+        ValType::Ref(ty) => ref_type_text(ty),
+        ty => ty.to_string(),
+    }
+}
+
+fn ref_type_text(ty: &RefType) -> String {
+    let heap = ty.heap_type();
+    if ty.is_nullable()
+        && let HeapType::Abstract { shared: false, ty } = heap
+    {
+        return format!("{}ref", nullable_abstract_name(ty));
+    }
+    let null = if ty.is_nullable() { "null " } else { "" };
+    format!("(ref {null}{})", heap_type_text(&heap))
+}
+
+fn nullable_abstract_name(ty: AbstractHeapType) -> &'static str {
+    match ty {
+        AbstractHeapType::None => "null",
+        AbstractHeapType::NoExtern => "nullextern",
+        AbstractHeapType::NoFunc => "nullfunc",
+        AbstractHeapType::NoExn => "nullexn",
+        AbstractHeapType::NoCont => "nullcont",
+        ty => abstract_heap_type_name(ty),
+    }
+}
+
+fn heap_type_text(ty: &HeapType) -> String {
+    match ty {
+        HeapType::Abstract { shared: false, ty } => abstract_heap_type_name(*ty).to_owned(),
+        HeapType::Abstract { shared: true, ty } => {
+            format!("(shared {})", abstract_heap_type_name(*ty))
+        }
+        HeapType::Concrete(index) => type_index_name(index),
+        HeapType::Exact(index) => format!("(exact {})", type_index_name(index)),
     }
 }
 
@@ -476,37 +677,74 @@ impl Payload for BrTable<'_> {
 
 impl Payload for ValType {
     fn operand(&self, _field: &'static str) -> Operand {
-        Operand::Type(self.to_string())
+        Operand::Type(val_type_text(self))
     }
 }
 
 impl Payload for Vec<ValType> {
     fn operand(&self, _field: &'static str) -> Operand {
-        Operand::Types(self.iter().map(ValType::to_string).collect())
+        Operand::Types(self.iter().map(val_type_text).collect())
     }
 }
 
 impl Payload for RefType {
     fn operand(&self, _field: &'static str) -> Operand {
-        Operand::Type(self.to_string())
+        Operand::Type(ref_type_text(self))
     }
 }
 
+const CONCRETE_HEAP_TYPE: u64 = 0;
+const EXACT_HEAP_TYPE: u64 = 1;
+const ABSTRACT_HEAP_TYPE: u64 = 2;
+const SHARED_ABSTRACT_HEAP_TYPE: u64 = 3;
+
 impl Payload for HeapType {
+    const INPUTS: &'static [&'static str] = &["", "_kind"];
+
     fn operand(&self, _field: &'static str) -> Operand {
-        Operand::Type(match self {
-            HeapType::Abstract { shared, ty } => {
-                let name = abstract_heap_type_name(*ty);
-                if *shared {
-                    format!("shared {name}")
-                } else {
-                    name.to_owned()
-                }
-            }
-            HeapType::Concrete(index) => type_index_name(index),
-            HeapType::Exact(index) => format!("exact {}", type_index_name(index)),
-        })
+        Operand::Type(heap_type_text(self))
     }
+
+    fn values(&self) -> Vec<u64> {
+        match self {
+            HeapType::Concrete(index) => vec![type_index_value(index), CONCRETE_HEAP_TYPE],
+            HeapType::Exact(index) => vec![type_index_value(index), EXACT_HEAP_TYPE],
+            HeapType::Abstract { shared, ty } => vec![
+                u64::from(abstract_heap_type_code(*ty)),
+                if *shared {
+                    SHARED_ABSTRACT_HEAP_TYPE
+                } else {
+                    ABSTRACT_HEAP_TYPE
+                },
+            ],
+        }
+    }
+}
+
+fn abstract_heap_type_code(ty: AbstractHeapType) -> u8 {
+    match ty {
+        AbstractHeapType::Func => 0x70,
+        AbstractHeapType::Extern => 0x6f,
+        AbstractHeapType::Any => 0x6e,
+        AbstractHeapType::Eq => 0x6d,
+        AbstractHeapType::I31 => 0x6c,
+        AbstractHeapType::Struct => 0x6b,
+        AbstractHeapType::Array => 0x6a,
+        AbstractHeapType::Exn => 0x69,
+        AbstractHeapType::Cont => 0x68,
+        AbstractHeapType::None => 0x71,
+        AbstractHeapType::NoExtern => 0x72,
+        AbstractHeapType::NoFunc => 0x73,
+        AbstractHeapType::NoExn => 0x74,
+        AbstractHeapType::NoCont => 0x75,
+    }
+}
+
+fn type_index_value(index: &UnpackedIndex) -> u64 {
+    index
+        .as_module_index()
+        .or_else(|| index.as_rec_group_index())
+        .map_or(u64::MAX, u64::from)
 }
 
 fn abstract_heap_type_name(ty: AbstractHeapType) -> &'static str {
@@ -529,34 +767,60 @@ fn abstract_heap_type_name(ty: AbstractHeapType) -> &'static str {
 }
 
 fn type_index_name(index: &UnpackedIndex) -> String {
-    match index {
-        UnpackedIndex::Module(index) => index.to_string(),
-        UnpackedIndex::RecGroup(index) => format!("rec={index}"),
+    match (index.as_module_index(), index.as_rec_group_index()) {
+        (Some(index), _) => index.to_string(),
+        (_, Some(index)) => format!("rec={index}"),
         // `wasmparser` grows a third variant when its validator is compiled in, as the
         // conformance harness does
-        #[allow(unreachable_patterns)]
-        _ => "type=?".to_owned(),
+        (None, None) => "type=?".to_owned(),
     }
 }
 
 impl Payload for Ordering {
+    const INPUTS: &'static [&'static str] = &[""];
+
     fn operand(&self, _field: &'static str) -> Operand {
         Operand::Ordering(match self {
             Ordering::SeqCst => "seq_cst",
             Ordering::AcqRel => "acq_rel",
         })
     }
+
+    fn values(&self) -> Vec<u64> {
+        vec![match self {
+            Ordering::SeqCst => 0,
+            Ordering::AcqRel => 1,
+        }]
+    }
 }
 
 impl Payload for TryTable {
     fn operand(&self, _field: &'static str) -> Operand {
-        Operand::Table(format!("{} catches", self.catches.len()))
+        let clauses = self.catches.iter().map(|catch| match catch {
+            Catch::One { tag, label } => format!("(catch {tag} {label})"),
+            Catch::OneRef { tag, label } => format!("(catch_ref {tag} {label})"),
+            Catch::All { label } => format!("(catch_all {label})"),
+            Catch::AllRef { label } => format!("(catch_all_ref {label})"),
+        });
+        let parts: Vec<String> = block_type_text(&self.ty)
+            .into_iter()
+            .chain(clauses)
+            .collect();
+        Operand::Table(parts.join(" "))
     }
 }
 
 impl Payload for ResumeTable {
     fn operand(&self, _field: &'static str) -> Operand {
-        Operand::Table(format!("{} handlers", self.handlers.len()))
+        let handlers: Vec<String> = self
+            .handlers
+            .iter()
+            .map(|handle| match handle {
+                Handle::OnLabel { tag, label } => format!("(on {tag} {label})"),
+                Handle::OnSwitch { tag } => format!("(on {tag} switch)"),
+            })
+            .collect();
+        Operand::Table(handlers.join(" "))
     }
 }
 
@@ -784,6 +1048,32 @@ mod tests {
     }
 
     #[test]
+    fn types_and_handlers_render_as_the_text_format_writes_them() {
+        assert_eq!(
+            decoded(&[0x1f, 0x7f, 0x02, 0x00, 0x00, 0x01, 0x02, 0x02]).operands(),
+            [Operand::Table(
+                "(result i32) (catch 0 1) (catch_all 2)".to_owned()
+            )]
+        );
+        assert_eq!(
+            decoded(&[0x1c, 0x01, 0x70]).operands(),
+            [Operand::Type("funcref".to_owned())]
+        );
+        assert_eq!(
+            decoded(&[0x02, 0x63, 0x03]).operands(),
+            [Operand::BlockType(Some("(result (ref null 3))".to_owned()))]
+        );
+        assert_eq!(
+            decoded(&[0xfb, 0x24, 0x00]).operands(),
+            [Operand::Type("(ref null 0)".to_owned())]
+        );
+        assert_eq!(
+            decoded(&[0xfb, 0x23, 0x00]).operands(),
+            [Operand::Type("(ref 0)".to_owned())]
+        );
+    }
+
+    #[test]
     fn control_flow_classification() {
         assert_eq!(decoded(&[0x00]).flow(), Flow::Trap);
         assert_eq!(decoded(&[0x02, 0x40]).flow(), Flow::BlockStart);
@@ -807,6 +1097,17 @@ mod tests {
         assert!(!Flow::Trap.falls_through());
         assert!(!Flow::Branch.falls_through());
         assert!(!Flow::TailCall.falls_through());
+        assert!(
+            !Flow::Arm.falls_through(),
+            "an arm is jumped over, not run into"
+        );
+    }
+
+    #[test]
+    fn no_throw_falls_through() {
+        assert_eq!(decoded(&[0x08, 0x00]).flow(), Flow::Trap, "throw");
+        assert_eq!(decoded(&[0x09, 0x00]).flow(), Flow::Trap, "rethrow");
+        assert_eq!(decoded(&[0x0a]).flow(), Flow::Trap, "throw_ref");
     }
 
     #[test]
@@ -833,6 +1134,69 @@ mod tests {
         assert!(decode(&[0xff]).is_none(), "unassigned opcode");
         assert!(decode(&[0x20]).is_none(), "truncated immediate");
         assert!(decode(&[0x28, 0x02]).is_none(), "truncated memarg");
+    }
+
+    #[test]
+    fn an_intrinsic_takes_every_immediate_it_declares() {
+        let taken = |bytes: &[u8]| {
+            let insn = decode(bytes).expect("decodes");
+            let id = insn.operator_id().expect("an operator");
+            let values = immediates(&insn.op);
+            assert_eq!(values.len(), operator_immediates(id).len(), "{bytes:02x?}");
+            (operator_immediates(id), values)
+        };
+        let sixteen: Vec<u8> = (1..=16).collect();
+        let halves = vec![0x0807_0605_0403_0201, 0x100f_0e0d_0c0b_0a09];
+
+        let v128_const = [&[0xfd, 0x0c][..], &sixteen].concat();
+        assert_eq!(
+            taken(&v128_const),
+            (
+                vec!["value_low".into(), "value_high".into()],
+                halves.clone()
+            )
+        );
+        let shuffle = [&[0xfd, 0x0d][..], &sixteen].concat();
+        assert_eq!(
+            taken(&shuffle),
+            (vec!["lanes_low".into(), "lanes_high".into()], halves)
+        );
+        assert_eq!(
+            taken(&[0xfd, 0x1b, 0x03]),
+            (vec!["lane".into()], vec![3]),
+            "i32x4.extract_lane"
+        );
+        assert_eq!(
+            taken(&[0xfd, 0x54, 0x00, 0x08, 0x05]),
+            (vec!["lane".into()], vec![5]),
+            "v128.load8_lane, its offset folded into the address"
+        );
+        assert_eq!(
+            taken(&[0xfc, 0x0b, 0x00]),
+            (vec!["mem".into()], vec![0]),
+            "memory.fill"
+        );
+        assert_eq!(
+            taken(&[0xfe, 0x1e, 0x02, 0x10]),
+            (Vec::<String>::new(), Vec::new()),
+            "i32.atomic.rmw.add"
+        );
+        let heap_type = vec!["hty".into(), "hty_kind".into()];
+        assert_eq!(
+            taken(&[0xfb, 0x14, 0x03]),
+            (heap_type.clone(), vec![3, CONCRETE_HEAP_TYPE]),
+            "ref.test (ref 3)"
+        );
+        assert_eq!(
+            taken(&[0xfb, 0x15, 0x70]),
+            (heap_type, vec![0x70, ABSTRACT_HEAP_TYPE]),
+            "ref.test funcref"
+        );
+        assert_eq!(
+            taken(&[0xfe, 0x4f, 0x01, 0x02]).1,
+            vec![1, 2],
+            "global.atomic.get acq_rel 2"
+        );
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! semantics in [`crate::lift`]
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use binaryninja::architecture::{
     Architecture, ArchitectureExt, BasicBlockAnalysisContext, BranchKind, BranchType,
@@ -69,35 +71,35 @@ mod trace {
     }
 }
 
-/// Registers Binary Ninja needs that WebAssembly does not have
+pub const STACK_REGISTERS: u32 = 256;
+
+pub const ARGUMENT_REGISTERS: u32 = 64;
+
+pub const RESULT_REGISTERS: u32 = 64;
+
+pub const CAUGHT_REGISTERS: u32 = 8;
+
+pub const LOCAL_REGISTERS: u32 = 4096;
+
+const EXCEPTION_BASE: u32 = 2 + 2 * (STACK_REGISTERS + ARGUMENT_REGISTERS);
+
+const CAUGHT_BASE: u32 = EXCEPTION_BASE + 1;
+
+const LOCAL_BASE: u32 = CAUGHT_BASE + CAUGHT_REGISTERS;
+
+const RESULT_BASE: u32 = LOCAL_BASE + 2 * LOCAL_REGISTERS;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RegKind {
-    /// Top of the operand stack
     Sp,
-    /// Base of the current frame's locals
-    Fp,
     /// Return address, since wasm keeps its call stack out of reach of the program
     Lr,
-    /// A calling convention cannot describe results left on the operand stack, and without a
-    /// register for it every call reads as producing nothing
-    Rv,
-}
-
-impl RegKind {
-    pub const ALL: [Self; 4] = [Self::Sp, Self::Fp, Self::Lr, Self::Rv];
-
-    pub fn id(self) -> RegisterId {
-        RegisterId(match self {
-            Self::Sp => 0,
-            Self::Fp => 1,
-            Self::Lr => 2,
-            Self::Rv => 3,
-        })
-    }
-
-    fn from_id(id: RegisterId) -> Option<Self> {
-        Self::ALL.into_iter().find(|kind| kind.id() == id)
-    }
+    Stack(u32),
+    Argument(u32),
+    Exception,
+    Caught(u32),
+    Local(u32),
+    Result(u32),
 }
 
 /// The width comes along because [`RegisterInfo::size`] is asked without an architecture to ask
@@ -105,13 +107,68 @@ impl RegKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WasmRegister {
     pub kind: RegKind,
+    pub low: bool,
     /// Width of an address in the architecture this register belongs to
     pub pointer: usize,
 }
 
 impl WasmRegister {
     pub fn new(kind: RegKind, pointer: usize) -> Self {
-        Self { kind, pointer }
+        Self {
+            kind,
+            low: false,
+            pointer,
+        }
+    }
+
+    pub fn sized(kind: RegKind, width: usize, pointer: usize) -> Self {
+        Self {
+            kind,
+            low: width < SLOT as usize,
+            pointer,
+        }
+    }
+
+    fn from_id(id: RegisterId, pointer: usize) -> Option<Self> {
+        let kind = match id.0 {
+            0 => RegKind::Sp,
+            1 => RegKind::Lr,
+            n if n < 2 + 2 * STACK_REGISTERS => RegKind::Stack((n - 2) / 2),
+            n if n < EXCEPTION_BASE => RegKind::Argument((n - 2 - 2 * STACK_REGISTERS) / 2),
+            EXCEPTION_BASE => RegKind::Exception,
+            n if n < LOCAL_BASE => RegKind::Caught(n - CAUGHT_BASE),
+            n if n < RESULT_BASE => RegKind::Local((n - LOCAL_BASE) / 2),
+            n if n < RESULT_BASE + 2 * RESULT_REGISTERS => RegKind::Result((n - RESULT_BASE) / 2),
+            _ => return None,
+        };
+        let low = match kind {
+            RegKind::Stack(_) | RegKind::Argument(_) => id.0 % 2 == 1,
+            RegKind::Local(_) => (id.0 - LOCAL_BASE) % 2 == 1,
+            RegKind::Result(_) => (id.0 - RESULT_BASE) % 2 == 1,
+            _ => false,
+        };
+        Some(Self { kind, low, pointer })
+    }
+
+    fn all(pointer: usize, low: bool) -> impl Iterator<Item = Self> {
+        let halved = move |kind| {
+            let full = Self::new(kind, pointer);
+            std::iter::once(full).chain(low.then_some(Self { low: true, ..full }))
+        };
+        let operands = (0..STACK_REGISTERS)
+            .map(RegKind::Stack)
+            .chain((0..ARGUMENT_REGISTERS).map(RegKind::Argument));
+        let unpaired =
+            std::iter::once(RegKind::Exception).chain((0..CAUGHT_REGISTERS).map(RegKind::Caught));
+        let values = (0..LOCAL_REGISTERS)
+            .map(RegKind::Local)
+            .chain((0..RESULT_REGISTERS).map(RegKind::Result));
+        [RegKind::Sp, RegKind::Lr]
+            .into_iter()
+            .map(move |kind| Self::new(kind, pointer))
+            .chain(operands.flat_map(halved))
+            .chain(unpaired.map(move |kind| Self::new(kind, pointer)))
+            .chain(values.flat_map(halved))
     }
 }
 
@@ -119,12 +176,17 @@ impl Register for WasmRegister {
     type InfoType = Self;
 
     fn name(&self) -> Cow<'_, str> {
-        Cow::Borrowed(match self.kind {
-            RegKind::Sp => "sp",
-            RegKind::Fp => "fp",
-            RegKind::Lr => "lr",
-            RegKind::Rv => "rv",
-        })
+        let half = if self.low { "d" } else { "" };
+        match self.kind {
+            RegKind::Sp => Cow::Borrowed("sp"),
+            RegKind::Lr => Cow::Borrowed("lr"),
+            RegKind::Stack(n) => Cow::Owned(format!("s{n}{half}")),
+            RegKind::Argument(n) => Cow::Owned(format!("a{n}{half}")),
+            RegKind::Exception => Cow::Borrowed("exn"),
+            RegKind::Caught(n) => Cow::Owned(format!("caught{n}")),
+            RegKind::Local(n) => Cow::Owned(format!("l{n}{half}")),
+            RegKind::Result(n) => Cow::Owned(format!("r{n}{half}")),
+        }
     }
 
     fn info(&self) -> Self {
@@ -132,7 +194,17 @@ impl Register for WasmRegister {
     }
 
     fn id(&self) -> RegisterId {
-        self.kind.id()
+        let paired = match self.kind {
+            RegKind::Sp => return RegisterId(0),
+            RegKind::Lr => return RegisterId(1),
+            RegKind::Stack(n) => 2 + 2 * n,
+            RegKind::Argument(n) => 2 + 2 * (STACK_REGISTERS + n),
+            RegKind::Exception => return RegisterId(EXCEPTION_BASE),
+            RegKind::Caught(n) => return RegisterId(CAUGHT_BASE + n),
+            RegKind::Local(n) => LOCAL_BASE + 2 * n,
+            RegKind::Result(n) => RESULT_BASE + 2 * n,
+        };
+        RegisterId(paired + u32::from(self.low))
     }
 }
 
@@ -140,14 +212,17 @@ impl RegisterInfo for WasmRegister {
     type RegType = Self;
 
     fn parent(&self) -> Option<Self> {
-        None
+        self.low.then_some(Self {
+            low: false,
+            ..*self
+        })
     }
 
     fn size(&self) -> usize {
-        // A result is any wasm value, so it takes a whole slot rather than an address
         match self.kind {
-            RegKind::Rv => lift::SLOT as usize,
-            _ => self.pointer,
+            RegKind::Sp | RegKind::Lr | RegKind::Exception | RegKind::Caught(_) => self.pointer,
+            _ if self.low => 4,
+            _ => SLOT as usize,
         }
     }
 
@@ -156,36 +231,126 @@ impl RegisterInfo for WasmRegister {
     }
 
     fn implicit_extend(&self) -> ImplicitRegisterExtend {
-        ImplicitRegisterExtend::NoExtend
+        if self.low {
+            ImplicitRegisterExtend::ZeroExtendToFullWidth
+        } else {
+            ImplicitRegisterExtend::NoExtend
+        }
     }
 }
 
 /// Every operator gets one whether or not [`crate::lift`] models it, so an id read back from a
-/// saved database always resolves; only the unmodelled ones are ever emitted
+/// saved database always resolves
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WasmIntrinsic(pub u32);
+pub struct WasmIntrinsic {
+    pub id: u32,
+    pub pointer: usize,
+}
+
+const THROWN_NAME: &str = "thrown";
+const EXCEPTION_VALUE_NAME: &str = "exception_value";
+const RETHROW_NAME: &str = "rethrow";
+const THROW_NAME: &str = "throw";
+const SUSPENDED_NAME: &str = "suspended";
+
+pub const THROWN: u32 = insn::stable_id(THROWN_NAME);
+
+pub const EXCEPTION_VALUE: u32 = insn::stable_id(EXCEPTION_VALUE_NAME);
+
+pub const RETHROW: u32 = insn::stable_id(RETHROW_NAME);
+
+pub const SUSPENDED: u32 = insn::stable_id(SUSPENDED_NAME);
+
+const ESCAPES: [u32; 4] = [THROWN, EXCEPTION_VALUE, RETHROW, SUSPENDED];
+
+pub fn throw(values: u32) -> Option<u32> {
+    (values <= ARGUMENT_REGISTERS).then(|| insn::stable_id(&format!("{THROW_NAME}/{values}")))
+}
+
+fn thrown_values(id: u32) -> Option<u32> {
+    static BY_ID: OnceLock<HashMap<u32, u32>> = OnceLock::new();
+    BY_ID
+        .get_or_init(|| {
+            (0..=ARGUMENT_REGISTERS)
+                .filter_map(|values| Some((throw(values)?, values)))
+                .collect()
+        })
+        .get(&id)
+        .copied()
+}
+
+fn intrinsic_ids() -> impl Iterator<Item = u32> {
+    insn::operator_ids()
+        .chain(ESCAPES)
+        .chain((0..=ARGUMENT_REGISTERS).filter_map(throw))
+}
 
 impl Intrinsic for WasmIntrinsic {
     fn name(&self) -> Cow<'_, str> {
-        Cow::Owned(insn::operator_name(self.0).unwrap_or_else(|| format!("op{}", self.0)))
+        match self.id {
+            THROWN => Cow::Borrowed(THROWN_NAME),
+            EXCEPTION_VALUE => Cow::Borrowed(EXCEPTION_VALUE_NAME),
+            RETHROW => Cow::Borrowed(RETHROW_NAME),
+            SUSPENDED => Cow::Borrowed(SUSPENDED_NAME),
+            id if thrown_values(id).is_some() => Cow::Borrowed(THROW_NAME),
+            id => Cow::Owned(insn::operator_name(id).unwrap_or_else(|| format!("op{id}"))),
+        }
     }
 
     fn id(&self) -> IntrinsicId {
-        IntrinsicId(self.0)
+        IntrinsicId(self.id)
     }
 
-    /// A value's type belongs to the operator rather than the operand, and a slot is the same
-    /// width either way
+    /// An operator's operands and immediates are slots, since a value's type belongs to the
+    /// operator rather than the operand; the lifter's own intrinsics say what they take
     fn inputs(&self) -> Vec<NameAndType> {
-        let arity = insn::operator_arity(self.0).unwrap_or_default();
-        (0..arity.pops)
-            .map(|index| NameAndType::new(format!("arg{index}"), slot_type().into()))
-            .collect()
+        let exception = || NameAndType::new("exception", Type::int(self.pointer, false).into());
+        match self.id {
+            THROWN | SUSPENDED => Vec::new(),
+            EXCEPTION_VALUE => vec![
+                exception(),
+                NameAndType::new("index", Type::int(4, false).into()),
+            ],
+            RETHROW => vec![exception()],
+            id if let Some(values) = thrown_values(id) => std::iter::once(NameAndType::new(
+                "tag",
+                Type::int(self.pointer, false).into(),
+            ))
+            .chain(
+                (0..values).map(|nth| NameAndType::new(format!("value{nth}"), slot_type().into())),
+            )
+            .collect(),
+            id if let Some(conversion) = lift::saturating(id) => {
+                vec![NameAndType::new(
+                    "value",
+                    Type::float(conversion.from).into(),
+                )]
+            }
+            id => {
+                let arity = insn::operator_arity(id).unwrap_or_default();
+                (0..arity.pops)
+                    .map(|index| format!("arg{index}"))
+                    .chain(insn::operator_immediates(id))
+                    .map(|name| NameAndType::new(name, slot_type().into()))
+                    .collect()
+            }
+        }
     }
 
     fn outputs(&self) -> Vec<Conf<Ref<Type>>> {
-        let arity = insn::operator_arity(self.0).unwrap_or_default();
-        (0..arity.pushes).map(|_| slot_type().into()).collect()
+        match self.id {
+            THROWN | SUSPENDED => vec![Type::int(self.pointer, false).into()],
+            EXCEPTION_VALUE => vec![slot_type().into()],
+            RETHROW => Vec::new(),
+            id if thrown_values(id).is_some() => Vec::new(),
+            id if let Some(conversion) = lift::saturating(id) => {
+                vec![Type::int(conversion.to, conversion.signed).into()]
+            }
+            id => {
+                let arity = insn::operator_arity(id).unwrap_or_default();
+                (0..arity.pushes).map(|_| slot_type().into()).collect()
+            }
+        }
     }
 }
 
@@ -193,8 +358,6 @@ fn slot_type() -> Ref<Type> {
     Type::int(SLOT as usize, false)
 }
 
-/// Wasm passes arguments on the operand stack, so there is nothing here to name registers with,
-/// and saying so beats leaving the core to guess from a register file that means nothing
 struct WasmCallingConvention(CoreCallingConvention);
 
 impl AsRef<CoreCallingConvention> for WasmCallingConvention {
@@ -203,54 +366,97 @@ impl AsRef<CoreCallingConvention> for WasmCallingConvention {
     }
 }
 
+fn register_id(kind: RegKind) -> RegisterId {
+    WasmRegister::new(kind, 0).id()
+}
+
+fn argument_registers() -> Vec<RegisterId> {
+    (0..ARGUMENT_REGISTERS)
+        .map(|n| register_id(RegKind::Argument(n)))
+        .collect()
+}
+
+pub fn local_of(id: RegisterId) -> Option<u32> {
+    match WasmRegister::from_id(id, 0)? {
+        WasmRegister {
+            kind: RegKind::Local(n),
+            low: false,
+            ..
+        } => Some(n),
+        _ => None,
+    }
+}
+
+pub fn is_operand(id: RegisterId) -> bool {
+    matches!(
+        WasmRegister::from_id(id, 0),
+        Some(WasmRegister {
+            kind: RegKind::Stack(_),
+            ..
+        })
+    )
+}
+
+pub fn result_register(n: u32) -> RegisterId {
+    register_id(RegKind::Result(n))
+}
+
+pub fn clobbered_registers() -> Vec<RegisterId> {
+    argument_registers()
+        .into_iter()
+        .chain((0..RESULT_REGISTERS).map(result_register))
+        .chain([register_id(RegKind::Exception)])
+        .collect()
+}
+
 impl CallingConvention for WasmCallingConvention {
     fn caller_saved_registers(&self) -> Vec<RegisterId> {
-        vec![RegKind::Rv.id()]
+        clobbered_registers()
     }
 
     fn callee_saved_registers(&self) -> Vec<RegisterId> {
-        vec![RegKind::Fp.id(), RegKind::Lr.id()]
+        (0..STACK_REGISTERS)
+            .map(RegKind::Stack)
+            .chain([RegKind::Lr])
+            .chain((0..CAUGHT_REGISTERS).map(RegKind::Caught))
+            .map(register_id)
+            .collect()
     }
 
     fn int_arg_registers(&self) -> Vec<RegisterId> {
-        Vec::new()
+        argument_registers()
     }
 
     fn float_arg_registers(&self) -> Vec<RegisterId> {
-        Vec::new()
+        argument_registers()
     }
 
     fn arg_registers_shared_index(&self) -> bool {
-        false
+        true
     }
 
     fn reserved_stack_space_for_arg_registers(&self) -> bool {
         false
     }
 
-    /// The callee's locals live in a frame of their own, so the adjustment is emitted at the call
-    /// site; saying the callee did it has the core account for the same slots twice
     fn stack_adjusted_on_return(&self) -> bool {
         false
     }
 
-    /// There are no argument registers to guess about, and letting the core guess anyway changed
-    /// nothing about how many arguments a call site resolves
     fn is_eligible_for_heuristics(&self) -> bool {
         false
     }
 
     fn return_int_reg(&self) -> Option<RegisterId> {
-        Some(RegKind::Rv.id())
+        Some(result_register(0))
     }
 
     fn return_hi_int_reg(&self) -> Option<RegisterId> {
         None
     }
 
-    /// The same register: a result is a slot whatever its type, and [`lift::leave`] writes it there
     fn return_float_reg(&self) -> Option<RegisterId> {
-        Some(RegKind::Rv.id())
+        self.return_int_reg()
     }
 
     fn global_pointer_reg(&self) -> Option<RegisterId> {
@@ -279,13 +485,6 @@ impl WasmArchitecture {
             handle,
             core,
             pointer,
-        }
-    }
-
-    fn model(&self) -> Model {
-        Model {
-            addr: self.pointer,
-            ..Model::default()
         }
     }
 }
@@ -365,7 +564,7 @@ impl Architecture for WasmArchitecture {
                 Flow::Trap | Flow::Return | Flow::TailCall => {
                     info.add_branch(BranchKind::FunctionReturn)
                 }
-                Flow::Branch => info.add_branch(BranchKind::Unresolved),
+                Flow::Branch | Flow::Arm => info.add_branch(BranchKind::Unresolved),
                 Flow::IndirectBranch => info.add_branch(BranchKind::Indirect),
                 _ => {}
             },
@@ -398,13 +597,6 @@ impl Architecture for WasmArchitecture {
             return;
         }
 
-        // A function swept out of the middle of a body has to be recovered from the body it sits
-        // in, or none of its labels resolve
-        let module = module::lookup(id, start);
-        let body = module
-            .as_ref()
-            .and_then(|module| module.body_covering(start).map(|(_, i)| (i.entry, i.end)));
-
         // A code section lists every body exactly, so an address in the image that is not one of
         // their entries is not a function, whatever the core swept up
         //
@@ -422,25 +614,26 @@ impl Architecture for WasmArchitecture {
             return;
         }
 
-        let (from, len) = match body {
-            Some((entry, end)) => (entry, (end - entry).min(cfg::MAX_BODY_LEN as u64) as usize),
-            None => (
-                start,
-                file_end(&view)
-                    .saturating_sub(start)
-                    .min(context.max_function_size)
-                    .min(cfg::MAX_BODY_LEN as u64) as usize,
-            ),
+        let module = module::lookup(id, start);
+        let body_end = module
+            .as_ref()
+            .and_then(|module| module.body_covering(start).map(|(_, info)| info.end));
+        let len = match body_end {
+            Some(end) => (end - start).min(cfg::MAX_BODY_LEN as u64) as usize,
+            None => file_end(&view)
+                .saturating_sub(start)
+                .min(context.max_function_size)
+                .min(cfg::MAX_BODY_LEN as u64) as usize,
         };
 
-        let code = view.read_vec(from, len);
-        let flow = cfg::recover(&code, from, module.as_deref()).restricted_to(start);
+        let code = view.read_vec(start, len);
+        let flow = cfg::recover(&code, start, module.as_deref());
         cfg::install(id, &flow);
 
-        let blocks = flow.blocks();
+        let blocks = flow.reachable_blocks();
         if blocks.is_empty() {
             tracing::warn!(
-                "wasm: nothing decoded at {start:#x}, {} of {len} bytes read from {from:#x}",
+                "wasm: nothing decoded at {start:#x}, {} of {len} bytes read",
                 code.len()
             );
             if let Some(native) = context.create_basic_block(arch, start) {
@@ -467,7 +660,7 @@ impl Architecture for WasmArchitecture {
                 if *at >= block.end {
                     break;
                 }
-                let offset = (at - from) as usize;
+                let offset = (at - start) as usize;
                 if let Some(bytes) = code.get(offset..offset + size)
                     && let Some(instruction_data) = &instruction_data
                 {
@@ -534,47 +727,66 @@ impl Architecture for WasmArchitecture {
     ) -> Option<(usize, bool)> {
         if module::import_stub(addr) {
             // The body is somebody else's, and returning keeps the caller's control flow intact
-            let address = self.model().link(il);
-            il.add_instruction(il.ret(address));
+            let view = il.function().map(|function| view_id(&function.view()));
+            let results = view
+                .and_then(|view| module::import_signature(view, addr))
+                .map(|signature| signature.results)
+                .unwrap_or_default();
+            lift::stub(il, self.pointer, &results);
             return Some((module::IMPORT_STRIDE as usize, true));
         }
 
-        let decoded = insn::decode(data);
+        let decoded = insn::decode_any(data);
         trace::llil(addr, decoded.as_ref().map(|i| i.mnemonic()).as_deref());
         let insn = decoded?;
 
         // Unlike the other callbacks this one can say which file it is lifting, since the IL
         // belongs to a function and the function to a view
-        let (recovered, module) = match il.function() {
+        let (recovered, module, height, dispatch) = match il.function() {
             Some(function) => {
                 let view = view_id(&function.view());
-                (cfg::lookup(view, addr), module::lookup(view, addr))
+                (
+                    cfg::lookup(view, addr),
+                    module::lookup(view, addr),
+                    cfg::height(view, addr),
+                    cfg::dispatch(view, addr),
+                )
             }
-            None => (cfg::lookup_anywhere(addr), module::lookup_anywhere(addr)),
+            None => (
+                cfg::lookup_anywhere(addr),
+                module::lookup_anywhere(addr),
+                cfg::height_anywhere(addr),
+                cfg::dispatch_anywhere(addr),
+            ),
         };
 
         let resolved = module.as_ref().and_then(|module| module.resolve(&insn.op));
-        let width = module
-            .as_ref()
-            .and_then(|module| moved_width(module, addr, &insn.op));
         // The width comes from the architecture the view chose, and where the globals live from
         // the file, since each is laid out in a place of its own
+        let layout = module
+            .as_ref()
+            .map(|module| module.layout)
+            .or_else(|| module::layout_covering(addr))
+            .unwrap_or_default();
+        let global = match insn.op {
+            Operator::GlobalGet { global_index } | Operator::GlobalSet { global_index } => module
+                .as_ref()
+                .and_then(|module| module.global_kind(global_index)),
+            _ => None,
+        };
         let model = Model {
-            global_base: module
-                .as_ref()
-                .map(|module| module.layout.global_base)
-                .or_else(|| module::layout_covering(addr).map(|layout| layout.global_base))
-                .unwrap_or_default(),
-            table_base: module
-                .as_ref()
-                .map(|module| module.layout.table_base)
-                .or_else(|| module::layout_covering(addr).map(|layout| layout.table_base))
-                .unwrap_or_default(),
+            addr: self.pointer,
+            layout,
+            stack_pointer: module.as_ref().and_then(|module| {
+                let (_, info) = module.body_covering(addr)?;
+                info.frame.and(module.stack_pointer)
+            }),
             frame: module
-                .as_ref()
+                .as_deref()
                 .and_then(|module| frame_at(module, addr))
                 .unwrap_or_default(),
-            ..self.model()
+            height,
+            global,
         };
         lift::lift(
             il,
@@ -582,24 +794,22 @@ impl Architecture for WasmArchitecture {
             &insn,
             recovered.as_ref(),
             resolved.as_ref(),
-            width,
+            dispatch.as_ref(),
         );
         // The flag reports whether lifting succeeded rather than whether control continues
         Some((insn.len, true))
     }
 
     fn registers_all(&self) -> Vec<Self::Register> {
-        RegKind::ALL
-            .map(|kind| WasmRegister::new(kind, self.pointer))
-            .to_vec()
+        WasmRegister::all(self.pointer, true).collect()
     }
 
     fn registers_full_width(&self) -> Vec<Self::Register> {
-        self.registers_all()
+        WasmRegister::all(self.pointer, false).collect()
     }
 
     fn register_from_id(&self, id: RegisterId) -> Option<Self::Register> {
-        RegKind::from_id(id).map(|kind| WasmRegister::new(kind, self.pointer))
+        WasmRegister::from_id(id, self.pointer)
     }
 
     fn stack_pointer_reg(&self) -> Option<Self::Register> {
@@ -611,13 +821,22 @@ impl Architecture for WasmArchitecture {
     }
 
     fn intrinsics(&self) -> Vec<Self::Intrinsic> {
-        (0..insn::operator_count() as u32)
-            .map(WasmIntrinsic)
+        intrinsic_ids()
+            .map(|id| WasmIntrinsic {
+                id,
+                pointer: self.pointer,
+            })
             .collect()
     }
 
     fn intrinsic_from_id(&self, id: IntrinsicId) -> Option<Self::Intrinsic> {
-        (id.0 < insn::operator_count() as u32).then_some(WasmIntrinsic(id.0))
+        (insn::operator_name(id.0).is_some()
+            || ESCAPES.contains(&id.0)
+            || thrown_values(id.0).is_some())
+        .then_some(WasmIntrinsic {
+            id: id.0,
+            pointer: self.pointer,
+        })
     }
 
     fn can_assemble(&self) -> bool {
@@ -630,7 +849,20 @@ impl Architecture for WasmArchitecture {
 
     /// An instruction can be neutralised whenever its operands can be dropped in the space it
     /// already occupies
-    fn convert_to_nop(&self, data: &mut [u8], _addr: u64) -> bool {
+    fn convert_to_nop(&self, data: &mut [u8], addr: u64) -> bool {
+        if let Some(Operator::LocalSet { local_index }) = insn::decode(data).map(|insn| insn.op)
+            && !module::lookup_anywhere(addr)
+                .and_then(|module| {
+                    let (function, _) = module.body_covering(addr)?;
+                    module
+                        .local_kinds(function)
+                        .get(local_index as usize)
+                        .copied()
+                })
+                .is_some_and(|kind| kind != module::ValueKind::Ref)
+        {
+            return false;
+        }
         asm::nop_out(data)
     }
 
@@ -675,35 +907,16 @@ pub(crate) fn file_end(view: &BinaryView) -> u64 {
 }
 
 /// How the function covering `addr` lays its locals out, and whether this is its first instruction
-fn frame_at(module: &module::Module, addr: u64) -> Option<lift::Frame> {
+fn frame_at(module: &module::Module, addr: u64) -> Option<lift::Frame<'_>> {
     let (function, info) = module.body_covering(addr)?;
     Some(lift::Frame {
         params: info.signature.params.len() as u32,
-        locals: module.local_count(function),
-        results: info.signature.results.len() as u32,
-        result: info.signature.results.first().copied(),
+        locals: module.local_kinds(function),
+        results: &info.signature.results,
         entry: addr == info.entry,
+        stack: info.frame.map(|(holder, _)| holder),
+        balanced: info.balanced,
     })
-}
-
-/// Without it the lifter moves every local at the slot width, writing eight bytes into a slot the
-/// next operator reads four out of, which the core warns about on every access
-fn moved_width(module: &module::Module, addr: u64, op: &Operator) -> Option<usize> {
-    let kind = match op {
-        Operator::LocalGet { local_index }
-        | Operator::LocalSet { local_index }
-        | Operator::LocalTee { local_index } => {
-            let (function, _) = module.body_covering(addr)?;
-            module.local_kind(function, *local_index)?
-        }
-        Operator::GlobalGet { global_index } | Operator::GlobalSet { global_index } => {
-            module.global_kind(*global_index)?
-        }
-        _ => return None,
-    };
-
-    // A `v128` is wider than a slot, and the model has nowhere to put the rest of it
-    Some(kind.size().min(SLOT as usize))
 }
 
 /// Every raw `.wasm` view starts at zero, so without this two files open at once would share one
@@ -725,23 +938,11 @@ fn describe(terminator: &Terminator, info: &mut InstructionInfo) {
             info.add_branch(BranchKind::False(*not_taken));
         }
         // A table knows exactly where it goes, but only three branches fit here
-        Terminator::Table { targets, default } => {
-            let mut distinct: Vec<u64> = Vec::new();
-            let mut leaves = false;
-            for target in targets.iter().chain([default]) {
-                match target {
-                    Some(to) if !distinct.contains(to) => distinct.push(*to),
-                    Some(_) => {}
-                    None => leaves = true,
-                }
-            }
-
-            if distinct.len() + usize::from(leaves) <= BRANCH_SLOTS {
-                for to in distinct {
-                    info.add_branch(BranchKind::Unconditional(to));
-                }
-                if leaves {
-                    info.add_branch(BranchKind::FunctionReturn);
+        Terminator::Table { .. } | Terminator::Suspend { .. } => {
+            let edges = terminator.edges();
+            if edges.len() <= BRANCH_SLOTS {
+                for edge in edges {
+                    info.add_branch(branch_kind(edge));
                 }
             } else {
                 info.add_branch(BranchKind::Indirect);
@@ -752,10 +953,20 @@ fn describe(terminator: &Terminator, info: &mut InstructionInfo) {
             info.add_branch(BranchKind::FunctionReturn);
             info.add_branch(BranchKind::False(*not_taken));
         }
-        // A trap continues nowhere, and the `noret` in the IL stops anything downstream reading
-        // this as a real return
+        // Nothing falls through a trap or a throw, and the IL ends one in `noret` or in the handler
+        // a throw lands in, so nothing downstream reads this as a real return
         Terminator::Halt => info.add_branch(BranchKind::FunctionReturn),
         Terminator::Unresolved => info.add_branch(BranchKind::Unresolved),
+    }
+}
+
+fn branch_kind(edge: Edge) -> BranchKind {
+    match edge {
+        Edge::Unconditional(to) => BranchKind::Unconditional(to),
+        Edge::True(to) => BranchKind::True(to),
+        Edge::False(to) => BranchKind::False(to),
+        Edge::FunctionReturn => BranchKind::FunctionReturn,
+        Edge::Unresolved => BranchKind::Unresolved,
     }
 }
 
@@ -882,6 +1093,7 @@ fn operand_tokens(operand: &Operand) -> Vec<(String, InstructionTextTokenKind)> 
             })
             .collect(),
         Operand::Ordering(name) => vec![((*name).to_owned(), InstructionTextTokenKind::Annotation)],
+        Operand::Table(summary) if summary.is_empty() => Vec::new(),
         Operand::Table(summary) => vec![(summary.clone(), InstructionTextTokenKind::Annotation)],
     }
 }
@@ -932,46 +1144,113 @@ mod tests {
 
     #[test]
     fn register_ids_are_distinct_and_round_trip() {
-        let mut seen = Vec::new();
-        for reg in RegKind::ALL {
-            assert!(!seen.contains(&reg.id()), "{reg:?} reuses an id");
-            seen.push(reg.id());
-            assert_eq!(
-                RegKind::ALL.into_iter().find(|r| r.id() == reg.id()),
-                Some(reg)
-            );
+        let all: Vec<_> = WasmRegister::all(4, true).collect();
+        let end = RESULT_BASE + 2 * RESULT_REGISTERS;
+        assert_eq!(all.len(), end as usize);
+        let mut seen = std::collections::BTreeSet::new();
+        for reg in all {
+            assert!(seen.insert(reg.id().0), "{reg:?} reuses an id");
+            assert_eq!(WasmRegister::from_id(reg.id(), 4), Some(reg));
         }
+        assert_eq!(WasmRegister::from_id(RegisterId(end), 4), None);
     }
 
     #[test]
-    fn every_operator_has_an_intrinsic_id() {
-        assert!(insn::operator_count() > 600);
+    fn a_saved_register_id_still_names_the_same_register() {
+        let named =
+            |id: u32| WasmRegister::from_id(RegisterId(id), 4).map(|reg| reg.name().into_owned());
+        assert_eq!(named(3).as_deref(), Some("s0d"));
+        assert_eq!(named(EXCEPTION_BASE).as_deref(), Some("exn"));
+        assert_eq!(named(EXCEPTION_BASE + 1).as_deref(), Some("caught0"));
+        assert_eq!(named(EXCEPTION_BASE + 9).as_deref(), Some("l0"));
+        assert_eq!(named(EXCEPTION_BASE + 12).as_deref(), Some("l1d"));
+        assert_eq!(named(RESULT_BASE + 1).as_deref(), Some("r0d"));
+    }
 
-        for id in 0..insn::operator_count() as u32 {
-            let name = insn::operator_name(id).expect("every id names an operator");
+    #[test]
+    fn every_operator_has_an_intrinsic_id_of_its_own() {
+        let ids: Vec<u32> = insn::operator_ids().collect();
+        assert!(ids.len() > 600);
+        for id in &ids {
+            let name = insn::operator_name(*id).expect("every id names an operator");
             assert!(!name.is_empty());
-            assert_eq!(WasmIntrinsic(id).id(), IntrinsicId(id));
+            assert_eq!(
+                WasmIntrinsic {
+                    id: *id,
+                    pointer: 4
+                }
+                .id(),
+                IntrinsicId(*id)
+            );
         }
 
-        assert!(insn::operator_name(insn::operator_count() as u32).is_none());
+        let every: Vec<u32> = intrinsic_ids().collect();
+        let distinct: std::collections::BTreeSet<u32> = every.iter().copied().collect();
+        assert_eq!(distinct.len(), every.len(), "two intrinsics hash to one id");
+        assert_eq!(
+            every.len(),
+            ids.len() + ESCAPES.len() + ARGUMENT_REGISTERS as usize + 1
+        );
+        for values in [0, 3, ARGUMENT_REGISTERS] {
+            let id = throw(values).expect("within the limit");
+            assert_eq!(thrown_values(id), Some(values));
+        }
+        assert_eq!(throw(ARGUMENT_REGISTERS + 1), None);
+    }
+
+    #[test]
+    fn an_intrinsic_id_is_the_same_in_every_build() {
+        let id = |bytes: &[u8]| insn::decode(bytes).and_then(|insn| insn.operator_id());
+        assert_eq!(id(&[0x08, 0x00]), Some(0x10a7_f343), "throw");
+        assert_eq!(id(&[0x6a]), Some(0xbdc8_d671), "i32.add");
+        assert_eq!(id(&[0x00]), Some(0x2167_5135), "unreachable");
+        assert_eq!((THROWN, EXCEPTION_VALUE), (0x0ca2_2853, 0x3c2a_9948));
     }
 
     #[test]
     fn register_ids_stay_out_of_the_temporary_range() {
-        for reg in RegKind::ALL {
+        for reg in WasmRegister::all(8, true) {
             assert!(!reg.id().is_temporary(), "{reg:?}");
         }
     }
 
     #[test]
     fn a_register_holding_an_address_is_as_wide_as_one() {
-        for kind in [RegKind::Sp, RegKind::Fp, RegKind::Lr] {
+        for kind in [RegKind::Sp, RegKind::Lr] {
             assert_eq!(WasmRegister::new(kind, 4).size(), 4);
             assert_eq!(WasmRegister::new(kind, 8).size(), 8);
         }
-        // A result is any wasm value, so it takes a whole slot either way
-        assert_eq!(WasmRegister::new(RegKind::Rv, 4).size(), SLOT as usize);
-        assert_eq!(WasmRegister::new(RegKind::Rv, 8).size(), SLOT as usize);
+    }
+
+    #[test]
+    fn a_value_register_is_a_slot_with_a_zero_extending_low_half() {
+        for kind in [RegKind::Stack(3), RegKind::Argument(0), RegKind::Result(2)] {
+            let full = WasmRegister::sized(kind, 8, 4);
+            let low = WasmRegister::sized(kind, 4, 4);
+            assert_eq!(full.size(), SLOT as usize);
+            assert_eq!(full.parent(), None);
+            assert_eq!(low.size(), 4);
+            assert_eq!(low.parent(), Some(full));
+            assert_eq!(
+                low.implicit_extend(),
+                ImplicitRegisterExtend::ZeroExtendToFullWidth
+            );
+            assert_ne!(low.id(), full.id());
+        }
+        assert_eq!(WasmRegister::sized(RegKind::Stack(3), 4, 4).name(), "s3d");
+        assert_eq!(WasmRegister::sized(RegKind::Argument(1), 8, 4).name(), "a1");
+        assert_eq!(WasmRegister::sized(RegKind::Result(0), 4, 4).name(), "r0d");
+    }
+
+    #[test]
+    fn arguments_share_one_register_list_for_every_type() {
+        let registers = argument_registers();
+        assert_eq!(registers.len(), ARGUMENT_REGISTERS as usize);
+        assert_eq!(registers[0], register_id(RegKind::Argument(0)));
+        assert!(registers.iter().all(|id| matches!(
+            WasmRegister::from_id(*id, 4).map(|r| (r.kind, r.low)),
+            Some((RegKind::Argument(_), false))
+        )));
     }
 
     #[test]
@@ -1077,11 +1356,15 @@ mod tests {
             Operand::Type("any".to_owned()),
             Operand::Types(vec!["i32".to_owned()]),
             Operand::Ordering("seq_cst"),
-            Operand::Table("0 catches".to_owned()),
+            Operand::Table("(catch_all 0)".to_owned()),
         ];
 
         for operand in &operands {
             assert!(!render(operand).is_empty(), "{operand:?} rendered nothing");
         }
+        assert!(
+            render(&Operand::Table(String::new())).is_empty(),
+            "a try_table with no result and no clauses"
+        );
     }
 }

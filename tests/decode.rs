@@ -1,7 +1,9 @@
 //! Whole-decoder behaviour, exercised the way Binary Ninja exercises it: arbitrary bytes with no
 //! promise that any of it is a real instruction
 
-use binja_wasm::insn::{Instruction, MAX_INSTR_LEN, decode, decode_any};
+use binja_wasm::insn::{
+    Instruction, MAX_INSTR_LEN, decode, decode_any, immediates, operator_immediates,
+};
 use binja_wasm::{asm, cfg, lift};
 
 /// Every input has to come back as a decode or a clean `None`, and the core goes on to ask for the
@@ -44,7 +46,14 @@ fn exercise(insn: &Instruction) {
     let _ = insn.operands();
     let _ = insn.arity();
     let _ = insn.flow();
-    let _ = insn.operator_id();
+    if let Some(id) = insn.operator_id() {
+        assert_eq!(
+            immediates(&insn.op).len(),
+            operator_immediates(id).len(),
+            "{} passes its intrinsic a different number of immediates than it declares",
+            insn.mnemonic()
+        );
+    }
     let _ = lift::stack_effect(insn, None);
 }
 

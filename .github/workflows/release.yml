@@ -33,12 +33,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: ${{ matrix.setup }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -47,9 +47,11 @@ jobs:
           key: ${{ matrix.runner }}
 
       - name: Build and package
-        run: python scripts/dist.py --ref "${{ github.ref_name }}" ${{ matrix.targets }}
+        env:
+          REF: ${{ github.ref_name }}
+        run: python scripts/dist.py --ref "$REF" ${{ matrix.targets }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binja-wasm-${{ matrix.runner }}
           path: dist/*
@@ -63,19 +65,21 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
       - id: name
+        env:
+          REF: ${{ github.ref_name }}
         run: |
           api=$(python scripts/versions.py --api)
-          echo "release=${{ github.ref_name }} (BN $api)" >> "$GITHUB_OUTPUT"
+          echo "release=$REF (BN $api)" >> "$GITHUB_OUTPUT"
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           name: ${{ steps.name.outputs.release }}
           files: dist/*

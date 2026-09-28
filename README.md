@@ -6,7 +6,8 @@ A WebAssembly architecture plugin for [Binary Ninja](https://binary.ninja/).
 
 - BNIL lifting
 - Control flow and call graph recovery
-- Debug info from the `name` section and DWARF
+- Debug info from the `name` section, DWARF (including split `.dwo` and `.dwp` files beside the
+  module), and Emscripten/Unity symbol maps
 - Memory64 support
 - Component model support
 - Text format assembly and patching
@@ -17,6 +18,7 @@ A WebAssembly architecture plugin for [Binary Ninja](https://binary.ninja/).
 Prebuilt binaries are provided for each release on the
 [releases page](https://github.com/chadhyatt/binja-wasm/releases). Extract and drop the plugin library for your platform into
 your user plugins directory:
+
 - Linux: `~/.binaryninja/plugins`
 - macOS: `~/Library/Application Support/Binary Ninja/plugins`
 - Windows: `%APPDATA%\Binary Ninja\plugins`
@@ -24,6 +26,7 @@ your user plugins directory:
 ### Building
 
 Prerequisites:
+
 - Binary Ninja installed and licensed
 - Rust
 - Clang

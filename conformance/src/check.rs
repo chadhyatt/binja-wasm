@@ -16,6 +16,7 @@ pub fn module(file: &Path, image: &[u8], report: &mut Report) {
         // Malformed by design, or using something the validator rejects; counted so a corpus that
         // stopped validating at all cannot read as a clean sweep
         report.invalid += 1;
+        survive(image);
         return;
     }
 
@@ -24,6 +25,24 @@ pub fn module(file: &Path, image: &[u8], report: &mut Report) {
     for span in module::core_module_spans(image) {
         if let Some(nested) = image.get(span) {
             core_module(file, nested, report);
+        }
+    }
+}
+
+fn survive(image: &[u8]) {
+    for module in module::parse_all(image, 0) {
+        for (_, info) in module.functions() {
+            let Some(code) = image.get(info.entry as usize..info.end as usize) else {
+                continue;
+            };
+            let flow = cfg::recover(code, info.entry, Some(&module));
+            let _ = flow.blocks();
+            for (at, _) in &flow.instructions {
+                let Some(insn) = insn::decode_any(&code[(at - info.entry) as usize..]) else {
+                    continue;
+                };
+                let _ = lift::stack_effect(&insn, module.resolve(&insn.op).as_ref());
+            }
         }
     }
 }
@@ -167,10 +186,9 @@ fn function(
         // one no plugin could disassemble and is counted rather than failed
         if consumed > insn::MAX_INSTR_LEN as u64 {
             report.oversized += 1;
-            return;
         }
 
-        let Some(decoded) = insn::decode(&code[offset..]) else {
+        let Some(decoded) = insn::decode_any(&code[offset..]) else {
             report.fail(file, format!("{at:#x}: no decode for {op:?}"));
             return;
         };
@@ -204,7 +222,6 @@ fn function(
             // than silence
             report.unchecked += 1;
         }
-        arity(file, at, &decoded, truth, report);
         stack_effect(file, at, &decoded, call, truth, report);
         call_target(file, at, &op, truth, read, report);
 
@@ -225,8 +242,7 @@ fn function(
     control_flow(file, code, start, read, &truth_heights, report);
 }
 
-/// Every [`cfg::Unwind`] is derived from this, and unwinding by the wrong amount moves the stack
-/// pointer somewhere the rest of the block is then addressed off
+/// Every [`cfg::Unwind`] is derived from this
 ///
 /// Only compared where control reaches the instruction and the walk claims to know the height,
 /// since claiming to know one that disagrees is the failure
@@ -256,26 +272,104 @@ fn heights(
     }
 }
 
-fn arity(
+fn landings(
     file: &Path,
-    at: u64,
-    decoded: &insn::Instruction,
-    truth: Option<(u32, u32)>,
+    code: &[u8],
+    start: u64,
+    flow: &cfg::ControlFlow,
+    truth: &[(u64, Option<u64>)],
     report: &mut Report,
 ) {
-    let (Some(ours), Some((pops, pushes))) = (decoded.arity(), truth) else {
-        return;
+    let validator = |addr: u64| {
+        let nth = truth.binary_search_by_key(&addr, |(at, _)| *at).ok()?;
+        truth[nth].1.map(|height| height as i64)
     };
-    if (ours.pops, ours.pushes) != (pops, pushes) {
-        report.fail(
-            file,
-            format!(
-                "{at:#x}: {} arity is {}->{}, validator says {pops}->{pushes}",
-                decoded.mnemonic(),
-                ours.pops,
-                ours.pushes
-            ),
-        );
+    for ((addr, _), ours) in flow.instructions.iter().zip(&flow.heights) {
+        let (Some(before), Some(terminator)) = (ours, flow.terminators.get(addr)) else {
+            continue;
+        };
+        let Some(insn) = code
+            .get((addr - start) as usize..)
+            .and_then(insn::decode_any)
+        else {
+            continue;
+        };
+        let taken = match insn.flow() {
+            insn::Flow::Branch => *before,
+            insn::Flow::ConditionalBranch => before - lift::taken_pops(&insn.op),
+            insn::Flow::IndirectBranch => before - 1,
+            _ if insn::resume_table(&insn.op).is_some() => *before,
+            _ => continue,
+        };
+        let unwind = |index: usize| {
+            flow.unwinds
+                .get(addr)
+                .and_then(|unwinds| unwinds.get(index))
+                .copied()
+                .unwrap_or_default()
+        };
+        let edges: Vec<(u64, i64)> = match terminator {
+            cfg::Terminator::Jump(to) | cfg::Terminator::Branch { taken: to, .. } => {
+                vec![(*to, taken - i64::from(unwind(0).drop))]
+            }
+            cfg::Terminator::Table { targets, default } => targets
+                .iter()
+                .chain([default])
+                .enumerate()
+                .filter_map(|(nth, to)| Some(((*to)?, taken - i64::from(unwind(nth).drop))))
+                .collect(),
+            cfg::Terminator::Suspend { handlers, .. } => handlers
+                .iter()
+                .enumerate()
+                .filter_map(|(nth, (_, to))| {
+                    let unwind = unwind(nth);
+                    Some((
+                        (*to)?,
+                        taken + i64::from(unwind.keep) - i64::from(unwind.drop),
+                    ))
+                })
+                .collect(),
+            _ => continue,
+        };
+        for (to, lands) in edges {
+            let Some(expected) = validator(to) else {
+                continue;
+            };
+            report.landings += 1;
+            if lands != expected {
+                report.fail(
+                    file,
+                    format!(
+                        "{addr:#x}: {} lands at {to:#x} with {lands} on the stack, validator says \
+                         {expected}",
+                        insn.mnemonic()
+                    ),
+                );
+                return;
+            }
+        }
+    }
+    for (addr, dispatch) in &flow.dispatch {
+        for clause in dispatch.offered().clauses {
+            let (Some(to), Some(base)) = (clause.target, clause.base) else {
+                continue;
+            };
+            let Some(expected) = validator(to) else {
+                continue;
+            };
+            let lands = base + i64::from(clause.carried) + i64::from(clause.exnref);
+            report.landings += 1;
+            if lands != expected {
+                report.fail(
+                    file,
+                    format!(
+                        "{addr:#x}: a handler lands at {to:#x} with {lands} on the stack, \
+                         validator says {expected}"
+                    ),
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -300,10 +394,9 @@ fn stack_effect(
                 );
             }
         }
-        // `None` is a claim rather than an omission where control leaves the instruction, and an
-        // arm is the same; anything else returning `None` is a real gap
+        // `None` is a claim rather than an omission where control leaves the instruction, arms
+        // included; anything else returning `None` is a real gap
         (None, _) if !decoded.flow().falls_through() => report.leaves(decoded.mnemonic()),
-        (None, _) if matches!(decoded.flow(), insn::Flow::Arm) => report.leaves(decoded.mnemonic()),
         (None, _) => report.unmodelled(decoded.mnemonic()),
         (Some(_), None) => {}
     }
@@ -351,7 +444,10 @@ fn terminators_exist(
     report: &mut Report,
 ) {
     for (addr, _) in &flow.instructions {
-        let Some(insn) = code.get((addr - start) as usize..).and_then(insn::decode) else {
+        let Some(insn) = code
+            .get((addr - start) as usize..)
+            .and_then(insn::decode_any)
+        else {
             continue;
         };
         let decides = matches!(
@@ -387,6 +483,7 @@ fn control_flow(
 
     terminators_exist(file, code, start, &flow, report);
     heights(file, &flow, truth, report);
+    landings(file, code, start, &flow, truth, report);
     report.unwinding += flow
         .unwinds
         .values()
@@ -439,6 +536,62 @@ fn control_flow(
                         "edge from {:#x} to {target:#x} is not a block start",
                         block.start
                     ),
+                );
+                return;
+            }
+        }
+    }
+
+    dispatch(file, &flow, &blocks, report);
+}
+
+/// Every handler a raise can reach has to start a block, and one reached from live code has to be
+/// handed to the core, or its code is never analysed
+fn dispatch(file: &Path, flow: &cfg::ControlFlow, blocks: &[cfg::Block], report: &mut Report) {
+    let reachable = flow.reachable_blocks();
+    if reachable.first().map(|block| block.start) != Some(flow.start)
+        || reachable.iter().any(|block| !blocks.contains(block))
+    {
+        report.fail(
+            file,
+            format!(
+                "the reachable blocks at {:#x} are not blocks of the body",
+                flow.start
+            ),
+        );
+        return;
+    }
+    let reached = |at: u64| {
+        reachable
+            .iter()
+            .any(|block| (block.start..block.end).contains(&at))
+    };
+    report.dispatching += flow.dispatch.len() as u64;
+    for (at, dispatch) in &flow.dispatch {
+        if flow
+            .instructions
+            .binary_search_by_key(at, |(start, _)| *start)
+            .is_err()
+        {
+            report.fail(
+                file,
+                format!("{at:#x}: dispatch where no instruction starts"),
+            );
+            return;
+        }
+        let offered = dispatch.offered().clauses;
+        for target in offered.into_iter().filter_map(|clause| clause.target) {
+            if !blocks.iter().any(|block| block.start == target) {
+                report.fail(
+                    file,
+                    format!("{at:#x}: the handler at {target:#x} is not a block start"),
+                );
+                return;
+            }
+            if reached(*at) && !reached(target) {
+                report.fail(
+                    file,
+                    format!("{at:#x}: the handler at {target:#x} is dropped though this is live"),
                 );
                 return;
             }

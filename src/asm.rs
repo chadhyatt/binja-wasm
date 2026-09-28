@@ -12,9 +12,23 @@ pub fn assemble(text: &str) -> Result<Vec<u8>, String> {
         return Ok(Vec::new());
     }
 
+    let code = assembled(text, "")?;
+    if code != assembled(text, TYPE_AHEAD)? {
+        return Err(
+            "a signature written inline or left out names a type this module may not have; \
+             write (type N)"
+                .to_owned(),
+        );
+    }
+    Ok(code)
+}
+
+const TYPE_AHEAD: &str = "(type (func (param i64 f64 i64)))";
+
+fn assembled(text: &str, types: &str) -> Result<Vec<u8>, String> {
     // The wrapper contributes the locals count and trailing `end` stripped off below
-    let module =
-        wat::parse_str(format!("(module (func {text}))")).map_err(|error| error.to_string())?;
+    let module = wat::parse_str(format!("(module {types} (func {text}))"))
+        .map_err(|error| error.to_string())?;
 
     let body = function_body(&module).ok_or("assembled module has no function body")?;
     let (locals, rest) = body
@@ -56,7 +70,7 @@ fn is_balanced(mut code: &[u8]) -> bool {
 
     let mut depth = 0i32;
     while !code.is_empty() {
-        let Some(insn) = insn::decode(code) else {
+        let Some(insn) = insn::decode_any(code) else {
             return false;
         };
         code = &code[insn.len..];
@@ -128,6 +142,37 @@ fn nop_replacement(data: &[u8]) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_inline_signature_is_refused_rather_than_renumbered() {
+        assert!(assemble("block (param i32) drop end").is_err());
+        assert!(assemble("block (result i32 i32) unreachable end").is_err());
+        assert!(assemble("call_indirect (param i32) (result i32)").is_err());
+        for signature in ["(param f64 i64 f64)", "(param i64 f64 i64)", ""] {
+            assert!(
+                assemble(&format!("call_indirect {signature}")).is_err(),
+                "{signature:?}"
+            );
+            assert!(assemble(&format!("return_call_indirect {signature}")).is_err());
+        }
+        assert_eq!(
+            assemble("call_indirect (type 3)"),
+            Ok(vec![0x11, 0x03, 0x00]),
+            "an explicit index is the module's own"
+        );
+        assert_eq!(
+            assemble("block (result i32) unreachable end"),
+            Ok(vec![0x02, 0x7f, 0x00, 0x0b]),
+            "a single result needs no type"
+        );
+    }
+
+    #[test]
+    fn a_long_branch_table_still_assembles() {
+        let labels = vec!["0"; 300].join(" ");
+        let code = assemble(&format!("block br_table {labels} end")).expect("assembles");
+        assert!(code.len() > crate::insn::MAX_INSTR_LEN);
+    }
 
     #[test]
     fn assembles_single_instructions() {

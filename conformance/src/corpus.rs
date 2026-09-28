@@ -58,12 +58,15 @@ impl Contents {
         }
     }
 
-    pub fn hole(&self) -> Option<String> {
+    pub fn hole(&self) -> Option<(usize, String)> {
         let first = self.rejected.first()?;
-        Some(format!(
-            "{} of {} forms unreadable, first at {first}",
+        Some((
             self.rejected.len(),
-            self.forms
+            format!(
+                "{} of {} forms unreadable, first at {first}",
+                self.rejected.len(),
+                self.forms
+            ),
         ))
     }
 }
@@ -187,6 +190,10 @@ fn script_modules(text: &str) -> Result<Vec<Vec<u8>>, wast::Error> {
             | wast::WastDirective::AssertInvalid { mut module, .. } => module.encode().ok(),
             // Valid wasm that only fails to link, which this harness never does
             wast::WastDirective::AssertUnlinkable { mut module, .. } => module.encode().ok(),
+            wast::WastDirective::AssertTrap {
+                exec: wast::WastExecute::Wat(mut module),
+                ..
+            } => module.encode().ok(),
             _ => None,
         })
         .collect())

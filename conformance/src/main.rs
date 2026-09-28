@@ -4,8 +4,7 @@
 //! Not a unit test: it wants a corpus on disk and it is slow
 //!
 //! Parsing is `wasmparser`'s job and is not under test; everything built on top of it is, above all
-//! that the stack effect the lifter applies matches what a real validator computes, since moving
-//! the stack pointer by the wrong amount corrupts every instruction after it
+//! that the stack effect the lifter applies matches what a real validator computes
 
 mod check;
 mod corpus;
@@ -70,17 +69,25 @@ fn main() -> ExitCode {
                 for module in &contents.modules {
                     check::module(file, module, &mut report);
                 }
-                contents.hole()
+                contents.hole().map(|(count, why)| (Some(count), why))
             }
-            Err(why) => Some(why),
+            Err(why) => Some((None, why)),
         };
         // Anything the harness cannot read is a hole in the corpus rather than a pass, unless it
         // is one of the handful known to be unreadable
         match (hole, known_unreadable(file)) {
-            (Some(why), Some(reason)) => report
+            (Some((Some(count), why)), Some((expected, reason))) if count == expected => report
                 .expected_unreadable
                 .push(format!("{} ({reason}): {why}", file.display())),
-            (Some(why), None) => report.unreadable.push(format!("{}: {why}", file.display())),
+            (Some((count, why)), Some((expected, _))) => report.unreadable.push(format!(
+                "{}: {} where {expected} forms were expected to be, {why}",
+                file.display(),
+                count.map_or_else(
+                    || "the whole file is unreadable".to_owned(),
+                    |count| format!("{count} forms are unreadable")
+                ),
+            )),
+            (Some((_, why)), None) => report.unreadable.push(format!("{}: {why}", file.display())),
             (None, Some(_)) => report.stale_expectations.push(file.display().to_string()),
             (None, None) => {}
         }
@@ -99,27 +106,38 @@ fn main() -> ExitCode {
 /// text format on a couple of newer tests
 ///
 /// Listed rather than ignored, so a hole can neither open nor close quietly
-const KNOWN_UNREADABLE: [(&str, &str); 6] = [
-    ("legacy/rethrow.wast", "legacy exception handling syntax"),
-    ("legacy/throw.wast", "legacy exception handling syntax"),
-    ("legacy/try_catch.wast", "legacy exception handling syntax"),
+const KNOWN_UNREADABLE: [(&str, usize, &str); 7] = [
+    ("legacy/rethrow.wast", 2, "legacy exception handling syntax"),
+    ("legacy/throw.wast", 1, "legacy exception handling syntax"),
     (
-        "legacy/try_delegate.wast",
+        "legacy/try_catch.wast",
+        7,
         "legacy exception handling syntax",
     ),
     (
+        "legacy/try_delegate.wast",
+        2,
+        "legacy exception handling syntax",
+    ),
+    (
+        "proposals/compact-import-section/imports-compact.wast",
+        4,
+        "empty compact import groups",
+    ),
+    (
         "proposals/extended-name-section/custom/name_annot.wast",
+        3,
         "field name annotations",
     ),
-    ("type-subtyping.wast", "multiple supertypes"),
+    ("type-subtyping.wast", 1, "multiple supertypes"),
 ];
 
-fn known_unreadable(path: &Path) -> Option<&'static str> {
+fn known_unreadable(path: &Path) -> Option<(usize, &'static str)> {
     let path = path.to_string_lossy().replace('\\', "/");
     KNOWN_UNREADABLE
         .iter()
-        .find(|(suffix, _)| path.ends_with(suffix))
-        .map(|(_, reason)| *reason)
+        .find(|(suffix, _, _)| path.ends_with(suffix))
+        .map(|(_, count, reason)| (*count, *reason))
 }
 
 struct Options {

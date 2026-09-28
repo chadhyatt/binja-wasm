@@ -24,9 +24,10 @@ pub struct Report {
     /// is what a branch out of that stretch cannot unwind correctly, so it is the one to watch
     pub heights_checked: u64,
     pub heights_unknown: u64,
-    /// Branch edges the lifter has to unwind, each one a stack pointer the core would otherwise
-    /// fail to merge
+    /// Branch edges the lifter has to unwind
     pub unwinding: u64,
+    pub landings: u64,
+    pub dispatching: u64,
     pub failures: Vec<String>,
     /// Corpus files with forms nothing could be read out of, which is a hole rather than a pass
     pub unreadable: Vec<String>,
@@ -55,6 +56,8 @@ impl Report {
             heights_checked: 0,
             heights_unknown: 0,
             unwinding: 0,
+            landings: 0,
+            dispatching: 0,
             failures: Vec::new(),
             unreadable: Vec::new(),
             expected_unreadable: Vec::new(),
@@ -127,6 +130,14 @@ impl Report {
             self.heights_checked, self.heights_unknown
         );
         println!("{} branch edges unwind the operand stack", self.unwinding);
+        println!(
+            "{} branch and handler edges land at the height the validator gives their target",
+            self.landings
+        );
+        println!(
+            "{} calls and throws dispatch to handlers or leave the function",
+            self.dispatching
+        );
         if self.unchecked != 0 {
             println!(
                 "{} of {} instructions had nothing to compare against",
@@ -135,7 +146,7 @@ impl Report {
         }
         if self.invalid != 0 {
             println!(
-                "{} modules rejected by the validator, so unchecked",
+                "{} modules rejected by the validator, read without a panic but not compared",
                 self.invalid
             );
         }

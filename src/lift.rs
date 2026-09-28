@@ -1,89 +1,145 @@
-//! LLIL lifting for the WebAssembly operand stack
+//! LLIL lifting
 //!
-//! The operand stack is memory below [`RegKind::Sp`], one [`SLOT`] per value, with the locals in a
-//! frame below [`RegKind::Fp`] and the globals in a fixed region
-//!
-//! Values are written at their own width rather than the slot's, which is safe because a slot is
-//! statically typed and only ever read back at the type that wrote it
+//! The operand stack lives in the `s` registers, one per height [`crate::cfg`] records for the
+//! instruction, and the locals in the `l` registers; calls pass arguments in the `a` registers and
+//! results in the `r` registers the calling convention names. `sp` is the module's stack pointer
+//! global, in the functions that take their frame from it
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use binaryninja::low_level_il::expression::ValueExpr;
-use binaryninja::low_level_il::lifting::LowLevelILLabel;
+use binaryninja::low_level_il::lifting::{
+    LiftableLowLevelIL, LiftableLowLevelILWithSize, LowLevelILLabel,
+};
 use binaryninja::low_level_il::{
     LowLevelILMutableExpression, LowLevelILMutableFunction, LowLevelILRegisterKind,
-    LowLevelILTempRegister,
 };
 use wasmparser::Operator;
 
-use crate::arch::{RegKind, WasmIntrinsic, WasmRegister};
-use crate::cfg::{Recovered, Terminator, Unwind};
-use crate::insn::{Arity, Flow, Instruction};
-use crate::module::{Call, Resolved, ValueKind};
+use crate::arch::{
+    ARGUMENT_REGISTERS, EXCEPTION_VALUE, LOCAL_REGISTERS, RESULT_REGISTERS, RETHROW, RegKind,
+    STACK_REGISTERS, SUSPENDED, THROWN, WasmIntrinsic, WasmRegister, throw,
+};
+use crate::cfg::{Clause, Dispatch, Recovered, Terminator, Unwind};
+use crate::insn::{Flow, Instruction, immediates, memarg};
+use crate::module::{Call, Layout, Resolved, ValueKind};
 
-/// Wide enough for `i64` and `f64`; a `v128` does not fit and is left unlifted
+/// Wide enough for `i64` and `f64`; a `v128` is carried as a slot-sized token between the
+/// intrinsics that take and give it
 pub const SLOT: u64 = 8;
 
-/// An address is as wide as the module makes it, and where the globals live follows the file
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Model {
+/// An address is as wide as the module makes it, and where the globals live follows the file
+pub struct Model<'a> {
     pub addr: usize,
-    pub global_base: u64,
-    pub table_base: u64,
-    /// How many of the current function's locals are parameters, and how many there are in total
-    pub frame: Frame,
+    pub layout: Layout,
+    pub stack_pointer: Option<u32>,
+    pub frame: Frame<'a>,
+    pub height: Option<u32>,
+    pub global: Option<ValueKind>,
 }
 
-/// The parameters are the frame the caller built, first at the base and the rest above it; the
-/// ones the body declares for itself go below, in the room the prologue makes
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Frame {
+pub struct Frame<'a> {
     pub params: u32,
-    pub locals: u32,
-    pub results: u32,
-    pub result: Option<ValueKind>,
+    pub locals: &'a [ValueKind],
+    pub results: &'a [ValueKind],
     pub entry: bool,
+    pub stack: Option<u32>,
+    pub balanced: bool,
 }
 
-pub fn local_slot(params: u32, index: u32) -> i64 {
-    match index.checked_sub(params) {
-        None => i64::from(index) * SLOT as i64,
-        Some(declared) => -(i64::from(declared) + 1) * SLOT as i64,
+pub fn width(kind: ValueKind, pointer: usize) -> usize {
+    match kind {
+        ValueKind::Ref => pointer,
+        ValueKind::V128 => SLOT as usize,
+        kind => kind.size(),
     }
 }
 
-impl Frame {
-    /// Parameters run up from the base in declaration order, where [`argument_frame`] puts them,
-    /// and the declared locals go below
-    fn offset(self, index: u32) -> i64 {
-        local_slot(self.params, index)
+impl Model<'_> {
+    fn register(self, kind: RegKind, width: usize) -> LowLevelILRegisterKind<WasmRegister> {
+        LowLevelILRegisterKind::Arch(WasmRegister::sized(kind, width, self.addr))
     }
 
-    fn reserved(self) -> i64 {
-        i64::from(self.locals.saturating_sub(self.params)) * SLOT as i64
+    fn stack(self, index: u32, width: usize) -> LowLevelILRegisterKind<WasmRegister> {
+        self.register(RegKind::Stack(index), width)
     }
-}
 
-impl Default for Model {
-    fn default() -> Self {
-        Self {
-            addr: 4,
-            global_base: 0,
-            table_base: 0,
-            frame: Frame::default(),
+    fn argument(self, index: u32, width: usize) -> LowLevelILRegisterKind<WasmRegister> {
+        self.register(RegKind::Argument(index), width)
+    }
+
+    fn result(self, index: u32, width: usize) -> LowLevelILRegisterKind<WasmRegister> {
+        self.register(RegKind::Result(index), width)
+    }
+
+    fn intrinsic(self, id: u32) -> WasmIntrinsic {
+        WasmIntrinsic {
+            id,
+            pointer: self.addr,
         }
     }
-}
 
-impl Model {
-    fn reg(self, kind: RegKind) -> LowLevelILRegisterKind<WasmRegister> {
+    fn local(self, index: u32, width: usize) -> LowLevelILRegisterKind<WasmRegister> {
+        self.register(RegKind::Local(index), width)
+    }
+
+    fn pointer_register(self, kind: RegKind) -> LowLevelILRegisterKind<WasmRegister> {
         LowLevelILRegisterKind::Arch(WasmRegister::new(kind, self.addr))
     }
 
-    /// Where a return goes, since wasm keeps its call stack out of reach of the program
-    pub fn link<'a>(
-        self,
-        il: &'a LowLevelILMutableFunction,
-    ) -> LowLevelILMutableExpression<'a, ValueExpr> {
-        il.reg(self.addr, self.reg(RegKind::Lr))
+    fn tag(self, index: u32) -> u64 {
+        self.layout.tag_address(index)
+    }
+
+    fn local_width(self, index: u32) -> usize {
+        self.frame
+            .locals
+            .get(index as usize)
+            .map_or(SLOT as usize, |kind| width(*kind, self.addr))
+    }
+
+    fn global_width(self) -> usize {
+        self.global
+            .map_or(SLOT as usize, |kind| width(kind, self.addr))
+    }
+}
+
+fn slot<'a>(
+    il: &'a LowLevelILMutableFunction,
+    model: Model,
+    index: u32,
+    width: usize,
+) -> LowLevelILMutableExpression<'a, ValueExpr> {
+    if index < STACK_REGISTERS {
+        il.reg(width, model.stack(index, width))
+    } else {
+        il.expression(il.undefined())
+    }
+}
+
+fn set_slot(
+    il: &LowLevelILMutableFunction,
+    model: Model,
+    index: u32,
+    width: usize,
+    value: LowLevelILMutableExpression<'_, ValueExpr>,
+) {
+    if index < STACK_REGISTERS {
+        il.add_instruction(il.set_reg(width, model.stack(index, width), value));
+    }
+}
+
+static CROWDED: AtomicBool = AtomicBool::new(false);
+static SHORT: AtomicBool = AtomicBool::new(false);
+static CROWDED_CALL: AtomicBool = AtomicBool::new(false);
+static CROWDED_THROW: AtomicBool = AtomicBool::new(false);
+static CROWDED_LOCALS: AtomicBool = AtomicBool::new(false);
+
+fn warn_once(flag: &AtomicBool, message: std::fmt::Arguments) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        tracing::warn!("{message}");
     }
 }
 
@@ -95,67 +151,228 @@ pub fn lift(
     insn: &Instruction,
     recovered: Option<&Recovered>,
     resolved: Option<&Resolved>,
-    width: Option<usize>,
+    dispatch: Option<&Dispatch>,
 ) {
-    // Moving a local at the slot width writes eight bytes into a slot the next operator reads four
-    // out of, and the core warns on every such access
-    let moved = width.unwrap_or(SLOT as usize);
     if model.frame.entry {
         prologue(il, model);
     }
+    let sem = semantics(insn);
+
     // Calls come first, since a tail call is a terminator too and lifting it as one loses the
     // callee
-    if let Some(Resolved::Call(call)) = resolved
-        && lift_call(il, model, insn, call)
-    {
+    if let Some(Resolved::Call(call)) = resolved {
+        lift_call(il, model, insn, call, dispatch);
         return;
     }
-
+    if let Some(dispatch) = dispatch
+        && matches!(
+            insn.op,
+            Operator::Throw { .. } | Operator::ThrowRef | Operator::Rethrow { .. }
+        )
+    {
+        raise(il, model, insn, dispatch);
+        return;
+    }
+    let suspends = recovered
+        .is_some_and(|recovered| matches!(recovered.terminator, Terminator::Suspend { .. }));
     if let Some(recovered) = recovered
-        && lift_terminator(il, model, insn, recovered)
+        && !suspends
     {
+        lift_terminator(il, model, insn, recovered);
         return;
     }
 
-    match semantics(insn) {
-        Sem::Nop => il.add_instruction(il.nop()),
+    if let Sem::LocalGet(index) | Sem::LocalSet(index) | Sem::LocalTee(index) = sem
+        && index >= LOCAL_REGISTERS
+    {
+        crowded_locals();
+        if matches!(sem, Sem::LocalGet(_)) {
+            give_up(il, model, insn, sem, resolved);
+        } else {
+            il.add_instruction(il.unimplemented());
+        }
+        return;
+    }
+
+    match model.height {
+        Some(height) if fits(insn, sem, resolved, height) => {
+            operate(il, model, insn, sem, resolved, height)
+        }
+        Some(height) => {
+            let (flag, problem) = if height < demand(insn, sem, resolved).0 {
+                (&SHORT, "fewer operands than it takes")
+            } else {
+                (
+                    &CROWDED,
+                    "an operand stack deeper than the registers that hold it",
+                )
+            };
+            warn_once(
+                flag,
+                format_args!(
+                    "wasm: an instruction with {problem} is not lifted, first at {:?}",
+                    insn.mnemonic()
+                ),
+            );
+            give_up(il, model, insn, sem, resolved);
+        }
+        None => give_up(il, model, insn, sem, resolved),
+    }
+    if let Some(dispatch) = dispatch
+        && insn.flow().falls_through()
+    {
+        thrown_here(il, model, dispatch);
+    }
+    if let Some(recovered) = recovered {
+        lift_terminator(il, model, insn, recovered);
+    }
+}
+
+fn suspended(
+    il: &LowLevelILMutableFunction,
+    model: Model,
+    recovered: &Recovered,
+    handlers: &[(u32, Option<u64>)],
+) {
+    let tag = model.pointer_register(RegKind::Exception);
+    il.add_instruction(il.intrinsic(
+        [tag],
+        model.intrinsic(SUSPENDED),
+        std::iter::empty::<LowLevelILMutableExpression<'_, ValueExpr>>(),
+    ));
+    for (index, (handled, target)) in handlers.iter().enumerate() {
+        let mut hit = LowLevelILLabel::new();
+        let mut miss = LowLevelILLabel::new();
+        let wanted = il.const_ptr_sized(model.addr, model.tag(*handled));
+        il.add_instruction(il.if_expr(
+            il.cmp_e(model.addr, il.reg(model.addr, tag), wanted),
+            &mut hit,
+            &mut miss,
+        ));
+        il.mark_label(&mut hit);
+        let unwind = recovered.unwind(index);
+        if let Some(base) = model
+            .height
+            .and_then(|height| height.checked_sub(unwind.drop))
+        {
+            for nth in 0..unwind.keep {
+                let to = base.saturating_add(nth);
+                set_slot(il, model, to, SLOT as usize, il.expression(il.undefined()));
+            }
+        }
+        go(il, model, *target, None);
+        il.mark_label(&mut miss);
+    }
+}
+
+fn give_up(
+    il: &LowLevelILMutableFunction,
+    model: Model,
+    insn: &Instruction,
+    sem: Sem,
+    resolved: Option<&Resolved>,
+) {
+    match insn.flow() {
+        Flow::Trap => {
+            il.add_instruction(il.no_ret());
+            return;
+        }
+        Flow::Return => {
+            leave(il, model, None);
+            return;
+        }
+        _ => {}
+    }
+    if matches!(sem, Sem::Nop) && insn.flow().falls_through() {
+        il.add_instruction(il.nop());
+        return;
+    }
+    il.add_instruction(il.unimplemented());
+    if let Some(height) = model.height {
+        let (pops, pushes) = demand(insn, sem, resolved);
+        let base = height.saturating_sub(pops);
+        for index in (base..base.saturating_add(pushes)).take_while(|at| *at < STACK_REGISTERS) {
+            set_slot(
+                il,
+                model,
+                index,
+                SLOT as usize,
+                il.expression(il.undefined()),
+            );
+        }
+    }
+    if !matches!(insn.flow(), Flow::Normal | Flow::Call | Flow::IndirectCall) {
+        il.add_instruction(il.jump(il.unimplemented()));
+    }
+}
+
+fn operate(
+    il: &LowLevelILMutableFunction,
+    model: Model,
+    insn: &Instruction,
+    sem: Sem,
+    resolved: Option<&Resolved>,
+    height: u32,
+) {
+    let get = |index: u32, width: usize| il.reg(width, model.stack(index, width));
+    let set = |index: u32, width: usize, value: LowLevelILMutableExpression<'_, ValueExpr>| {
+        il.add_instruction(il.set_reg(width, model.stack(index, width), value));
+    };
+
+    match sem {
+        Sem::Nop | Sem::Drop => il.add_instruction(il.nop()),
         Sem::Trap => il.add_instruction(il.no_ret()),
-        Sem::Return => leave(il, model),
-        Sem::Const { size, value } => {
-            push(il, model);
-            let value = il.const_int(size, value);
-            il.add_instruction(il.store(size, slot(il, model, 0), value));
+        Sem::Return => leave(il, model, Some(height)),
+        Sem::Const { size, value } => set(height, size, il.const_int(size, value)),
+        Sem::Null => set(height, model.addr, il.const_int(model.addr, 0)),
+        Sem::IsNull => {
+            let zero = il.const_int(model.addr, 0);
+            let result = compare(il, Cmp::Eq, model.addr, get(height - 1, model.addr), zero);
+            set(height - 1, RESULT_I32, result);
+        }
+        Sem::TableGet => {
+            let slot = table_slot(il, model, height - 1);
+            let value = il.expression(il.load(model.addr, slot));
+            set(height - 1, model.addr, value);
+        }
+        Sem::TableSet => {
+            let slot = table_slot(il, model, height - 2);
+            let value = get(height - 1, model.addr);
+            il.add_instruction(il.store(model.addr, slot, value));
         }
         Sem::Unary { size, kind } => {
-            let value = peek(il, model, 0, size);
-            let result = unary(il, kind, size, value);
-            il.add_instruction(il.store(size, slot(il, model, 0), result));
+            let result = unary(il, kind, size, get(height - 1, size));
+            set(height - 1, size, result);
         }
         Sem::Binary { size, kind } => {
-            let left = peek(il, model, 1, size);
-            let right = peek(il, model, 0, size);
-            let result = binary(il, kind, size, left, right);
-            il.add_instruction(il.store(size, slot(il, model, 1), result));
-            pop(il, model, 1);
+            let result = binary(il, kind, size, get(height - 2, size), get(height - 1, size));
+            set(height - 2, size, result);
         }
         Sem::Compare { size, kind } => {
-            let left = peek(il, model, 1, size);
-            let right = peek(il, model, 0, size);
             // A comparison is built at the width of what it compares, but the answer is an `i32`
-            let result = compare(il, kind, size, left, right);
-            il.add_instruction(il.store(RESULT_I32, slot(il, model, 1), result));
-            pop(il, model, 1);
+            let result = compare(il, kind, size, get(height - 2, size), get(height - 1, size));
+            set(height - 2, RESULT_I32, result);
         }
         Sem::TestZero { size } => {
-            let value = peek(il, model, 0, size);
             let zero = il.const_int(size, 0);
-            let result = compare(il, Cmp::Eq, size, value, zero);
-            il.add_instruction(il.store(RESULT_I32, slot(il, model, 0), result));
+            let result = compare(il, Cmp::Eq, size, get(height - 1, size), zero);
+            set(height - 1, RESULT_I32, result);
         }
         Sem::Convert { from, to, kind } => {
-            let value = peek(il, model, 0, from);
-            let result = convert(il, kind, from, to, value);
-            il.add_instruction(il.store(to, slot(il, model, 0), result));
+            let value = if from < RESULT_I32 {
+                il.expression(il.low_part(from, get(height - 1, RESULT_I32)))
+            } else {
+                get(height - 1, from)
+            };
+            set(height - 1, to, convert(il, kind, from, to, value));
+        }
+        Sem::Saturate(conversion) => {
+            let value = get(height - 1, conversion.from);
+            il.add_instruction(il.intrinsic(
+                [model.stack(height - 1, conversion.to)],
+                model.intrinsic(conversion.id),
+                [value],
+            ));
         }
         Sem::Load {
             access,
@@ -163,115 +380,174 @@ pub fn lift(
             extend,
             offset,
         } => {
-            let address = linear_address(il, model, 0, offset);
+            let address = linear_address(il, model, height - 1, offset);
             let loaded = il.expression(il.load(access, address));
             let value = match extend {
                 Extend::None => loaded,
                 Extend::Sign => il.expression(il.sx(result, loaded)),
                 Extend::Zero => il.expression(il.zx(result, loaded)),
             };
-            il.add_instruction(il.store(result, slot(il, model, 0), value));
+            set(height - 1, result, value);
         }
         Sem::Store {
             access,
-            value: value_size,
+            value: size,
             offset,
         } => {
-            let address = linear_address(il, model, 1, offset);
-            let value = peek(il, model, 0, value_size);
-            let value = if access < value_size {
+            let address = linear_address(il, model, height - 2, offset);
+            let value = get(height - 1, size);
+            let value = if access < size {
                 il.expression(il.low_part(access, value))
             } else {
                 value
             };
             il.add_instruction(il.store(access, address, value));
-            pop(il, model, 2);
         }
         Sem::LocalGet(index) => {
-            push(il, model);
-            let value = il.expression(il.load(moved, frame_slot(il, model, index)));
-            il.add_instruction(il.store(moved, slot(il, model, 0), value));
+            let width = model.local_width(index);
+            set(height, width, il.reg(width, model.local(index, width)));
         }
-        Sem::LocalSet(index) => {
-            let value = peek(il, model, 0, moved);
-            il.add_instruction(il.store(moved, frame_slot(il, model, index), value));
-            pop(il, model, 1);
+        Sem::LocalSet(index) | Sem::LocalTee(index) => {
+            let width = model.local_width(index);
+            let value = get(height - 1, width);
+            il.add_instruction(il.set_reg(width, model.local(index, width), value));
         }
-        Sem::LocalTee(index) => {
-            let value = peek(il, model, 0, moved);
-            il.add_instruction(il.store(moved, frame_slot(il, model, index), value));
+        Sem::GlobalGet(index) if model.stack_pointer == Some(index) => {
+            let sp = il.reg(model.addr, model.pointer_register(RegKind::Sp));
+            set(height, model.addr, sp);
+        }
+        Sem::GlobalSet(index) if model.stack_pointer == Some(index) => {
+            let value = get(height - 1, model.addr);
+            il.add_instruction(il.set_reg(model.addr, model.pointer_register(RegKind::Sp), value));
         }
         Sem::GlobalGet(index) => {
-            push(il, model);
-            let value = il.expression(il.load(moved, global_slot(il, model, index)));
-            il.add_instruction(il.store(moved, slot(il, model, 0), value));
+            let width = model.global_width();
+            let value = il.expression(il.load(width, global_address(il, model, index)));
+            set(height, width, value);
         }
         Sem::GlobalSet(index) => {
-            let value = peek(il, model, 0, moved);
-            il.add_instruction(il.store(moved, global_slot(il, model, index), value));
-            pop(il, model, 1);
+            let width = model.global_width();
+            let value = get(height - 1, width);
+            il.add_instruction(il.store(width, global_address(il, model, index), value));
         }
-        Sem::Drop => pop(il, model, 1),
-        Sem::CondBranch => {
-            pop(il, model, 1);
-            il.add_instruction(il.unimplemented());
-        }
-        // Where it goes needs the block stack, but what it does to the operand stack does not
-        Sem::RefBranch => il.add_instruction(il.unimplemented()),
+        Sem::Select { values } => select(il, model, height, values),
+        Sem::CondBranch | Sem::RefBranch => give_up(il, model, insn, sem, resolved),
         // Not an intrinsic: the count is per instruction and an intrinsic's prototype is per
         // operator, so the two could not agree
-        Sem::Aggregate { pops, pushes } => aggregate(il, model, Arity { pops, pushes }),
-        // An aggregate whose width only the module knows, so `semantics` could not see it
-        _ if matches!(resolved, Some(Resolved::Aggregate(_))) => {
-            let Some(Resolved::Aggregate(arity)) = resolved else {
-                return;
-            };
-            aggregate(il, model, *arity);
-        }
-        Sem::Opaque => opaque(il, model, insn),
+        Sem::Aggregate { pops, pushes } => aggregate(il, model, height, pops, pushes),
+        Sem::Opaque => match resolved {
+            // An aggregate whose width only the module knows, so `semantics` could not see it
+            Some(Resolved::Aggregate(arity)) => {
+                aggregate(il, model, height, arity.pops, arity.pushes)
+            }
+            Some(Resolved::Function(entry)) => {
+                set(height, model.addr, il.const_ptr_sized(model.addr, *entry))
+            }
+            Some(Resolved::Switching(_)) => give_up(il, model, insn, sem, resolved),
+            _ => opaque(il, model, insn, sem, height),
+        },
+        Sem::OtherMemory => give_up(il, model, insn, sem, resolved),
     }
 }
 
-fn aggregate(il: &LowLevelILMutableFunction, model: Model, arity: Arity) {
-    let net = i64::from(arity.pops) - i64::from(arity.pushes);
-    if net != 0 {
-        adjust_sp(il, model, net * SLOT as i64);
-    }
-    for depth in 0..arity.pushes {
-        let value = il.undefined();
-        il.add_instruction(il.store(SLOT as usize, slot(il, model, u64::from(depth)), value));
+fn fits(insn: &Instruction, sem: Sem, resolved: Option<&Resolved>, height: u32) -> bool {
+    let (pops, pushes) = demand(insn, sem, resolved);
+    height <= STACK_REGISTERS
+        && height
+            .checked_sub(pops)
+            .is_some_and(|base| base.saturating_add(pushes) <= STACK_REGISTERS)
+}
+
+fn demand(insn: &Instruction, sem: Sem, resolved: Option<&Resolved>) -> (u32, u32) {
+    match resolved {
+        Some(Resolved::Call(call)) => (call.arity.pops, call.arity.pushes),
+        Some(Resolved::Aggregate(arity) | Resolved::Switching(arity)) => (arity.pops, arity.pushes),
+        Some(Resolved::Function(_)) => (0, 1),
+        None => match sem {
+            Sem::Aggregate { pops, pushes } => (pops, pushes),
+            Sem::Select { values } => (values.saturating_mul(2).saturating_add(1), values),
+            _ => {
+                let fixed = insn
+                    .arity()
+                    .map_or((0, 0), |arity| (arity.pops, arity.pushes));
+                (fixed.0.max(tested(&insn.op)), fixed.1)
+            }
+        },
     }
 }
 
-/// The operands a branch consumes are popped first, so the stack is right on every edge
+fn tested(op: &Operator) -> u32 {
+    u32::from(
+        matches!(op, Operator::If { .. })
+            || matches!(
+                crate::insn::flow(op),
+                Flow::ConditionalBranch | Flow::IndirectBranch
+            ),
+    )
+}
+
+fn select(il: &LowLevelILMutableFunction, model: Model, height: u32, values: u32) {
+    let first = height - 1 - 2 * values;
+    let second = height - 1 - values;
+    let condition = il.reg(RESULT_I32, model.stack(height - 1, RESULT_I32));
+    let zero = il.const_int(RESULT_I32, 0);
+    let chosen = il.expression(il.cmp_ne(RESULT_I32, condition, zero));
+
+    let mut done = LowLevelILLabel::new();
+    let mut other = LowLevelILLabel::new();
+    il.add_instruction(il.if_expr(chosen, &mut done, &mut other));
+    il.mark_label(&mut other);
+    for nth in 0..values {
+        let value = il.reg(SLOT as usize, model.stack(second + nth, SLOT as usize));
+        il.add_instruction(il.set_reg(
+            SLOT as usize,
+            model.stack(first + nth, SLOT as usize),
+            value,
+        ));
+    }
+    il.add_instruction(il.goto(&mut done));
+    il.mark_label(&mut done);
+}
+
+fn aggregate(il: &LowLevelILMutableFunction, model: Model, height: u32, pops: u32, pushes: u32) {
+    let base = height - pops;
+    for nth in 0..pushes {
+        il.add_instruction(il.set_reg(
+            SLOT as usize,
+            model.stack(base + nth, SLOT as usize),
+            il.undefined(),
+        ));
+    }
+    if pushes == 0 {
+        il.add_instruction(il.nop());
+    }
+}
+
 fn lift_terminator(
     il: &LowLevelILMutableFunction,
     model: Model,
     insn: &Instruction,
     recovered: &Recovered,
-) -> bool {
+) {
+    let height = model.height;
+    let consumed = u32::try_from(taken_pops(&insn.op)).unwrap_or(0);
+    let taken_top = height.and_then(|height| height.checked_sub(consumed));
+
     match &recovered.terminator {
         Terminator::Jump(target) => {
-            // `else` and `end` mark a place rather than consuming anything, but a real `br`
-            // reaches here too and that one unwinds
-            unwind(il, model, recovered.unwind(0));
-            go(il, model, Some(*target));
-            true
+            // `else`, `catch` and `catch_all` mark a place rather than consuming anything, but a
+            // real `br` reaches here too and that one unwinds
+            unwind(il, model, height, recovered.unwind(0));
+            go(il, model, Some(*target), height);
         }
         Terminator::Branch { taken, not_taken } => {
             let condition = branch_condition(il, model, insn);
-
-            // A reference test consumes its operand on one edge and not the other, either way round
-            let dropped = fallthrough_pops(insn);
-            let taken_dropped = taken_drops(insn);
             let leaving = recovered.unwind(0);
-            let fixup = dropped != 0 || taken_dropped != 0 || !leaving.is_empty();
-
             match (
                 il.label_for_address(*taken),
                 il.label_for_address(*not_taken),
             ) {
-                (Some(mut hit), Some(mut miss)) if !fixup => {
+                (Some(mut hit), Some(mut miss)) if leaving.is_empty() => {
                     il.add_instruction(il.if_expr(condition, &mut hit, &mut miss));
                 }
                 // Either an edge needs work before it is taken or the core has no label for one of
@@ -282,60 +558,39 @@ fn lift_terminator(
                     il.add_instruction(il.if_expr(condition, &mut hit, &mut miss));
 
                     il.mark_label(&mut hit);
-                    // Before the unwind, which counts from a height the operand has already left
-                    if taken_dropped != 0 {
-                        pop(il, model, taken_dropped);
-                    }
-                    unwind(il, model, leaving);
-                    go(il, model, Some(*taken));
+                    unwind(il, model, taken_top, leaving);
+                    go(il, model, Some(*taken), taken_top);
 
                     il.mark_label(&mut miss);
-                    if dropped != 0 {
-                        pop(il, model, dropped);
-                    }
-                    go(il, model, Some(*not_taken));
+                    go(il, model, Some(*not_taken), height);
                 }
             }
-            true
         }
         Terminator::Table { targets, default } => {
-            lift_table(il, model, targets, *default, recovered);
-            true
+            lift_table(il, model, targets, *default, recovered)
         }
-        Terminator::Return => {
-            // A `return` leaves what the function produces on the stack, and the frame the caller
-            // restores is its own business
-            leave(il, model);
-            true
+        Terminator::Return if insn.flow() == Flow::TailCall => {
+            il.add_instruction(il.tailcall(il.unimplemented()))
         }
+        Terminator::Return => leave(il, model, taken_top),
         Terminator::ConditionalReturn { .. } => {
+            let condition = branch_condition(il, model, insn);
             // Two labels of its own rather than addresses, since the return is not an instruction
             // anywhere in the function
-            let condition = branch_condition(il, model, insn);
             let mut leaving = LowLevelILLabel::new();
             let mut carry_on = LowLevelILLabel::new();
             il.add_instruction(il.if_expr(condition, &mut leaving, &mut carry_on));
 
             il.mark_label(&mut leaving);
-            // As in `Branch`: the result `leave` reads sits under whatever the edge consumed
-            pop(il, model, taken_drops(insn));
-            leave(il, model);
+            leave(il, model, taken_top);
 
             il.mark_label(&mut carry_on);
-            pop(il, model, fallthrough_pops(insn));
-            true
         }
-        Terminator::Halt => {
-            il.add_instruction(il.no_ret());
-            true
-        }
-        Terminator::Unresolved => {
-            // Not knowing where it goes is no reason to leave its condition on the stack
-            if matches!(insn.op, Operator::BrIf { .. } | Operator::If { .. }) {
-                pop(il, model, 1);
-            }
-            il.add_instruction(il.jump(il.unimplemented()));
-            true
+        Terminator::Halt => il.add_instruction(il.no_ret()),
+        Terminator::Unresolved => il.add_instruction(il.jump(il.unimplemented())),
+        Terminator::Suspend { handlers, next } => {
+            suspended(il, model, recovered, handlers);
+            go(il, model, Some(*next), None);
         }
     }
 }
@@ -345,162 +600,326 @@ fn branch_condition<'a>(
     model: Model,
     insn: &Instruction,
 ) -> LowLevelILMutableExpression<'a, ValueExpr> {
-    match insn.op {
-        // The value moves to a temporary first, since the test is emitted as part of the branch
-        // after the pop, by which point `sp` no longer points at the slot it came from
-        Operator::BrIf { .. } | Operator::If { .. } => {
-            let held = temp(0);
-            let value = peek(il, model, 0, RESULT_I32);
-            il.add_instruction(il.set_reg(RESULT_I32, held, value));
-            pop(il, model, 1);
-
-            let condition = il.reg(RESULT_I32, held);
-            let zero = il.const_int(RESULT_I32, 0);
-            il.expression(il.cmp_ne(RESULT_I32, condition, zero))
-        }
-        // Which edge keeps the reference is decided by the type of the block branched to, which
-        // this layer cannot see
-        Operator::BrOnNull { .. } => {
-            let value = peek(il, model, 0, model.addr);
-            let null = il.const_int(model.addr, 0);
-            il.expression(il.cmp_e(model.addr, value, null))
-        }
-        Operator::BrOnNonNull { .. } => {
-            let value = peek(il, model, 0, model.addr);
-            let null = il.const_int(model.addr, 0);
-            il.expression(il.cmp_ne(model.addr, value, null))
-        }
+    let Some(top) = model.height.and_then(|height| height.checked_sub(1)) else {
+        return il.unimplemented();
+    };
+    let (size, test_null) = match insn.op {
+        Operator::BrIf { .. } | Operator::If { .. } => (RESULT_I32, false),
+        Operator::BrOnNull { .. } => (model.addr, true),
+        Operator::BrOnNonNull { .. } => (model.addr, false),
         // A type is not a value the IL has, and an unknown condition keeps both edges live
-        _ => il.unimplemented(),
+        _ => return il.unimplemented(),
+    };
+    let value = slot(il, model, top, size);
+    let zero = il.const_int(size, 0);
+    if test_null {
+        il.expression(il.cmp_e(size, value, zero))
+    } else {
+        il.expression(il.cmp_ne(size, value, zero))
     }
 }
 
-/// The arguments are consumed here rather than by the callee, whose locals are lifted against `fp`
-/// so it never reads the caller's operand stack
 fn lift_call(
     il: &LowLevelILMutableFunction,
     model: Model,
     insn: &Instruction,
     call: &Call,
-) -> bool {
-    let target = match insn.op {
-        Operator::Call { .. } | Operator::ReturnCall { .. } => match call.target {
+    dispatch: Option<&Dispatch>,
+) {
+    let base = model
+        .height
+        .and_then(|height| height.checked_sub(call.arity.pops));
+    let callee = model.height.and_then(|height| height.checked_sub(1));
+    let target = match (&insn.op, callee) {
+        (Operator::Call { .. } | Operator::ReturnCall { .. }, _) => match call.target {
             Some(entry) => il.const_ptr(entry),
-            // An import has no body in this image, and an unknown target keeps the call in the IL
-            // without pointing it at an address that stands for nothing
             None => il.unimplemented(),
         },
-        // A reference is the callee itself, so it is read before the pop moves the stack out from
-        // under the call
-        Operator::CallRef { .. } | Operator::ReturnCallRef { .. } => {
-            let held = temp(0);
-            let callee = peek(il, model, 0, model.addr);
-            il.add_instruction(il.set_reg(model.addr, held, callee));
-            pop(il, model, 1);
-            il.reg(model.addr, held)
+        (Operator::CallRef { .. } | Operator::ReturnCallRef { .. }, Some(callee)) => {
+            slot(il, model, callee, model.addr)
         }
         // An index is not an address: the callee is whatever the slot holds, and naming the index
         // would point the call into linear memory
-        Operator::CallIndirect { table_index, .. }
-        | Operator::ReturnCallIndirect { table_index, .. } => {
-            let held = temp(0);
-            let index = peek(il, model, 0, model.addr);
-            il.add_instruction(il.set_reg(model.addr, held, index));
-            pop(il, model, 1);
-
-            // Only the first table has a region, so an index into another one resolves to nothing
-            if table_index != 0 {
-                il.unimplemented()
-            } else {
-                let index = il.reg(model.addr, held);
-                let stride = il.const_int(model.addr, model.addr as u64);
-                let offset = il.expression(il.mul(model.addr, index, stride));
-                let base = il.const_ptr_sized(model.addr, model.table_base);
-                let at = il.expression(il.add(model.addr, base, offset));
-                il.expression(il.load(model.addr, at))
-            }
+        (
+            Operator::CallIndirect { table_index: 0, .. }
+            | Operator::ReturnCallIndirect { table_index: 0, .. },
+            Some(callee),
+        ) => {
+            let at = table_slot(il, model, callee);
+            il.expression(il.load(model.addr, at))
         }
-        _ => return false,
+        // Only the first table has a region, so an index into another one resolves to nothing
+        _ => il.unimplemented(),
     };
 
-    // What is left of the arity after the callee operand is the arguments and the results
-    let arguments = i64::from(call.arity.pops) - i64::from(indirect(insn));
-    argument_frame(il, model, arguments, &call.params);
+    if call.params.len() > ARGUMENT_REGISTERS as usize || !returnable(&call.results) {
+        crowded(il);
+        if !insn.flow().falls_through() {
+            stub(il, model.addr, &call.results);
+            return;
+        }
+        if let Some(dispatch) = dispatch {
+            thrown_here(il, model, dispatch);
+        }
+        if let Some(base) = base {
+            for (nth, kind) in call.results.iter().enumerate() {
+                let width = width(*kind, model.addr);
+                let unknown = il.expression(il.undefined());
+                set_slot(il, model, base + nth as u32, width, unknown);
+            }
+        }
+        return;
+    }
+    for (nth, kind) in call.params.iter().enumerate() {
+        let width = width(*kind, model.addr);
+        let value = match base {
+            Some(base) => slot(il, model, base + nth as u32, width),
+            None => il.expression(il.undefined()),
+        };
+        il.add_instruction(il.set_reg(width, model.argument(nth as u32, width), value));
+    }
 
     // A tail call replaces the frame, so there is no stack left to put results back on
     if !insn.flow().falls_through() {
         il.add_instruction(il.tailcall(target));
-        return true;
+        return;
     }
 
     il.add_instruction(il.call(target));
-
-    // Drop the argument frame and the arguments, and make room for what came back
-    let net = arguments - i64::from(call.arity.pushes);
-    adjust_sp(il, model, (arguments + net) * SLOT as i64);
-
-    // The first result comes back in the register the convention names, which is what ties the
-    // value to the call; anything past it has nowhere to come from
-    for depth in 0..call.arity.pushes {
-        let (width, value) = if depth == call.arity.pushes - 1 {
-            let width = call.result.map_or(SLOT as usize, moved_width);
-            (width, il.reg(width, model.reg(RegKind::Rv)))
-        } else {
-            (SLOT as usize, il.expression(il.undefined()))
-        };
-        il.add_instruction(il.store(width, slot(il, model, u64::from(depth)), value));
+    if let Some(dispatch) = dispatch {
+        thrown_here(il, model, dispatch);
     }
-
-    true
+    let Some(base) = base else {
+        return;
+    };
+    for (nth, kind) in call
+        .results
+        .iter()
+        .enumerate()
+        .skip(usize::from(call.returns_argument))
+    {
+        let width = width(*kind, model.addr);
+        let value = il.reg(width, model.result(nth as u32, width));
+        set_slot(il, model, base + nth as u32, width, value);
+    }
 }
 
-/// A wasm call pushes its arguments onto a stack that grows down, so the first ends up highest,
-/// while the core lays a stack parameter list out the other way, and nothing in the type system can
-/// say so, since an explicit location is dropped when the type reaches a function
-///
-/// The core folds the copies into the call the way it folds a cdecl push
-fn argument_frame(
+fn thrown_here(il: &LowLevelILMutableFunction, model: Model, dispatch: &Dispatch) {
+    il.add_instruction(il.intrinsic(
+        [model.pointer_register(RegKind::Exception)],
+        model.intrinsic(THROWN),
+        std::iter::empty::<LowLevelILMutableExpression<'_, ValueExpr>>(),
+    ));
+    let mut raised = LowLevelILLabel::new();
+    let mut returned = LowLevelILLabel::new();
+    let exception = il.reg(model.addr, model.pointer_register(RegKind::Exception));
+    let none = il.const_int(model.addr, 0);
+    il.add_instruction(il.if_expr(
+        il.cmp_ne(model.addr, exception, none),
+        &mut raised,
+        &mut returned,
+    ));
+    il.mark_label(&mut raised);
+    catch(il, model, dispatch, Carried::Registers);
+    il.mark_label(&mut returned);
+}
+
+fn returnable(results: &[ValueKind]) -> bool {
+    results.len() <= RESULT_REGISTERS as usize
+}
+
+fn crowded_locals() {
+    warn_once(
+        &CROWDED_LOCALS,
+        format_args!("wasm: locals past the first {LOCAL_REGISTERS} are not lifted"),
+    );
+}
+
+fn crowded(il: &LowLevelILMutableFunction) {
+    warn_once(
+        &CROWDED_CALL,
+        format_args!(
+            "wasm: calls and returns with more than {ARGUMENT_REGISTERS} arguments or \
+             {RESULT_REGISTERS} results are not lifted"
+        ),
+    );
+    il.add_instruction(il.unimplemented());
+}
+
+#[derive(Clone, Copy)]
+enum Carried {
+    Registers,
+    Stack { tag: u32, top: Option<u32> },
+}
+
+fn raise(il: &LowLevelILMutableFunction, model: Model, insn: &Instruction, dispatch: &Dispatch) {
+    let carried = match (&insn.op, dispatch.tag) {
+        (Operator::Throw { .. }, Some(tag)) => Carried::Stack {
+            tag,
+            top: model.height.filter(|height| *height >= dispatch.carried),
+        },
+        (Operator::ThrowRef, _) => {
+            let exnref = match model.height.and_then(|height| height.checked_sub(1)) {
+                Some(top) => slot(il, model, top, model.addr),
+                None => il.expression(il.undefined()),
+            };
+            let exception = model.pointer_register(RegKind::Exception);
+            il.add_instruction(il.set_reg(model.addr, exception, exnref));
+            let mut null = LowLevelILLabel::new();
+            let mut thrown = LowLevelILLabel::new();
+            let none = il.const_int(model.addr, 0);
+            il.add_instruction(il.if_expr(
+                il.cmp_e(model.addr, il.reg(model.addr, exception), none),
+                &mut null,
+                &mut thrown,
+            ));
+            il.mark_label(&mut null);
+            il.add_instruction(il.no_ret());
+            il.mark_label(&mut thrown);
+            Carried::Registers
+        }
+        _ => {
+            let rethrown = match (dispatch.caught, dispatch.tag) {
+                (Some(caught), _) => {
+                    il.reg(model.addr, model.pointer_register(RegKind::Caught(caught)))
+                }
+                (None, Some(tag)) => il.const_ptr_sized(model.addr, model.tag(tag)),
+                (None, None) => il.expression(il.undefined()),
+            };
+            il.add_instruction(il.set_reg(
+                model.addr,
+                model.pointer_register(RegKind::Exception),
+                rethrown,
+            ));
+            Carried::Registers
+        }
+    };
+
+    catch(il, model, dispatch, carried);
+}
+
+fn propagate(il: &LowLevelILMutableFunction, model: Model, dispatch: &Dispatch, carried: Carried) {
+    let none: Vec<LowLevelILRegisterKind<WasmRegister>> = Vec::new();
+    match carried {
+        Carried::Stack { tag, top } => match throw(dispatch.carried) {
+            Some(id) => {
+                let first = top.map(|top| top - dispatch.carried);
+                let mut inputs = vec![il.const_ptr_sized(model.addr, model.tag(tag))];
+                for nth in 0..dispatch.carried {
+                    inputs.push(match first {
+                        Some(first) => slot(il, model, first + nth, SLOT as usize),
+                        None => il.expression(il.undefined()),
+                    });
+                }
+                il.add_instruction(il.intrinsic(none, model.intrinsic(id), inputs));
+            }
+            None => {
+                warn_once(
+                    &CROWDED_THROW,
+                    format_args!(
+                        "wasm: throws carrying more than {ARGUMENT_REGISTERS} values are not lifted"
+                    ),
+                );
+                il.add_instruction(il.unimplemented());
+            }
+        },
+        Carried::Registers => {
+            let exception = il.reg(model.addr, model.pointer_register(RegKind::Exception));
+            il.add_instruction(il.intrinsic(none, model.intrinsic(RETHROW), [exception]));
+        }
+    }
+    il.add_instruction(il.no_ret());
+}
+
+fn catch(il: &LowLevelILMutableFunction, model: Model, dispatch: &Dispatch, carried: Carried) {
+    let offered = dispatch.offered();
+    for clause in offered.clauses {
+        let tested = clause.tag.filter(|_| dispatch.tag.is_none());
+        let Some(tag) = tested else {
+            deliver(il, model, dispatch, clause, carried);
+            return;
+        };
+        let mut hit = LowLevelILLabel::new();
+        let mut miss = LowLevelILLabel::new();
+        let exception = il.reg(model.addr, model.pointer_register(RegKind::Exception));
+        let wanted = il.const_ptr_sized(model.addr, model.tag(tag));
+        il.add_instruction(il.if_expr(
+            il.cmp_e(model.addr, exception, wanted),
+            &mut hit,
+            &mut miss,
+        ));
+        il.mark_label(&mut hit);
+        deliver(il, model, dispatch, clause, carried);
+        il.mark_label(&mut miss);
+    }
+    if offered.truncated {
+        il.add_instruction(il.jump(il.unimplemented()));
+    } else {
+        propagate(il, model, dispatch, carried);
+    }
+}
+
+fn deliver(
     il: &LowLevelILMutableFunction,
     model: Model,
-    arguments: i64,
-    params: &[ValueKind],
+    dispatch: &Dispatch,
+    clause: &Clause,
+    carried: Carried,
 ) {
-    if arguments <= 0 {
+    if let (Some(_), Some(holder)) = (model.stack_pointer, model.frame.stack) {
+        let restored = clause
+            .restores
+            .or(model.frame.balanced.then_some(holder))
+            .filter(|local| *local < LOCAL_REGISTERS);
+        let frame = match restored {
+            Some(local) => il.reg(model.addr, model.local(local, model.addr)),
+            None => il.expression(il.undefined()),
+        };
+        il.add_instruction(il.set_reg(model.addr, model.pointer_register(RegKind::Sp), frame));
+    }
+    let exception = || match carried {
+        Carried::Stack { tag, .. } => il.const_ptr_sized(model.addr, model.tag(tag)),
+        Carried::Registers => il.reg(model.addr, model.pointer_register(RegKind::Exception)),
+    };
+    if let Some(keeps) = clause.keeps {
+        il.add_instruction(il.set_reg(
+            model.addr,
+            model.pointer_register(RegKind::Caught(keeps)),
+            exception(),
+        ));
+    }
+    let Some(base) = clause.base.and_then(|base| u32::try_from(base).ok()) else {
+        go(il, model, clause.target, None);
         return;
+    };
+    for nth in 0..clause.carried {
+        let to = base.saturating_add(nth);
+        match carried {
+            Carried::Registers if to < STACK_REGISTERS => {
+                let exception = il.reg(model.addr, model.pointer_register(RegKind::Exception));
+                let index = il.const_int(4, u64::from(nth));
+                il.add_instruction(il.intrinsic(
+                    [model.stack(to, SLOT as usize)],
+                    model.intrinsic(EXCEPTION_VALUE),
+                    [exception, index],
+                ));
+            }
+            Carried::Registers => {}
+            Carried::Stack { top, .. } => {
+                let value = match top {
+                    Some(top) => slot(il, model, top - dispatch.carried + nth, SLOT as usize),
+                    None => il.expression(il.undefined()),
+                };
+                set_slot(il, model, to, SLOT as usize, value);
+            }
+        }
     }
-    for nth in 0..arguments {
-        // Each at its own width, since copying a slot the caller wrote four bytes into as eight
-        // claims the other half meant something
-        let width = params
-            .get(nth as usize)
-            .map_or(SLOT as usize, |kind| moved_width(*kind));
-        let value = peek(il, model, (arguments - 1 - nth) as u64, width);
-        let at = signed_offset_from(il, model, RegKind::Sp, -(arguments - nth) * SLOT as i64);
-        il.add_instruction(il.store(width, at, value));
+    let mut top = base.saturating_add(clause.carried);
+    if clause.exnref {
+        set_slot(il, model, top, model.addr, exception());
+        top = top.saturating_add(1);
     }
-    adjust_sp(il, model, -arguments * SLOT as i64);
-}
-
-fn moved_width(kind: ValueKind) -> usize {
-    kind.size().min(SLOT as usize)
-}
-
-/// A reference test passes what it tested to the label, so only the fallthrough drops anything
-fn fallthrough_pops(insn: &Instruction) -> u64 {
-    match insn.op {
-        Operator::BrOnNonNull { .. }
-        | Operator::BrOnCastDescEq { .. }
-        | Operator::BrOnCastDescEqFail { .. } => 1,
-        _ => 0,
-    }
-}
-
-/// What the taken edge consumes and [`branch_condition`] has not already popped
-fn taken_drops(insn: &Instruction) -> u64 {
-    match insn.op {
-        Operator::BrIf { .. } | Operator::If { .. } => 0,
-        ref op => u64::try_from(taken_pops(op)).unwrap_or(0),
-    }
+    go(il, model, clause.target, Some(top));
 }
 
 /// A `br_on_null` discards the reference it tested when it branches and keeps it when it does not,
@@ -515,19 +934,8 @@ pub fn taken_pops(op: &Operator) -> i64 {
     }
 }
 
-fn indirect(insn: &Instruction) -> u32 {
-    u32::from(matches!(
-        insn.op,
-        Operator::CallIndirect { .. }
-            | Operator::ReturnCallIndirect { .. }
-            | Operator::CallRef { .. }
-            | Operator::ReturnCallRef { .. }
-    ))
-}
-
 /// LLIL exposes no jump table operation here, and a chain of tests says the same thing while
-/// keeping every edge visible; the index is copied to a temporary first, since popping it moves the
-/// stack out from under the later comparisons
+/// keeping every edge visible
 fn lift_table(
     il: &LowLevelILMutableFunction,
     model: Model,
@@ -535,16 +943,18 @@ fn lift_table(
     default: Option<u64>,
     recovered: &Recovered,
 ) {
-    let index = temp(0);
-    let value = peek(il, model, 0, RESULT_I32);
-    il.add_instruction(il.set_reg(RESULT_I32, index, value));
-    pop(il, model, 1);
+    let top = model.height.and_then(|height| height.checked_sub(1));
 
     for (entry, target) in targets.iter().enumerate() {
         let mut miss = LowLevelILLabel::new();
-        let selector = il.reg(RESULT_I32, index);
-        let wanted = il.const_int(RESULT_I32, entry as u64);
-        let matches = il.expression(il.cmp_e(RESULT_I32, selector, wanted));
+        let matches = match top {
+            Some(top) => {
+                let selector = slot(il, model, top, RESULT_I32);
+                let wanted = il.const_int(RESULT_I32, entry as u64);
+                il.expression(il.cmp_e(RESULT_I32, selector, wanted))
+            }
+            None => il.unimplemented(),
+        };
 
         // Each entry names a label of its own, so each unwinds by an amount of its own
         let leaving = recovered.unwind(entry);
@@ -560,54 +970,73 @@ fn lift_table(
                 let mut hit = LowLevelILLabel::new();
                 il.add_instruction(il.if_expr(matches, &mut hit, &mut miss));
                 il.mark_label(&mut hit);
-                unwind(il, model, leaving);
-                go(il, model, *target);
+                unwind(il, model, top, leaving);
+                go(il, model, *target, top);
             }
         }
         il.mark_label(&mut miss);
     }
 
-    unwind(il, model, recovered.unwind(targets.len()));
-    go(il, model, default);
+    unwind(il, model, top, recovered.unwind(targets.len()));
+    go(il, model, default, top);
 }
 
-/// The kept values move down over the discarded ones, highest destination first so a value is read
-/// before anything is written over it
-fn unwind(il: &LowLevelILMutableFunction, model: Model, unwind: Unwind) {
-    if unwind.is_empty() {
+fn unwind(il: &LowLevelILMutableFunction, model: Model, top: Option<u32>, unwind: Unwind) {
+    let Some(from) = top.and_then(|top| top.checked_sub(unwind.keep)) else {
+        return;
+    };
+    let Some(to) = from.checked_sub(unwind.drop) else {
+        return;
+    };
+    if to == from {
         return;
     }
-
-    let drop = u64::from(unwind.drop);
-    for depth in (0..u64::from(unwind.keep)).rev() {
-        let value = peek(il, model, depth, SLOT as usize);
-        il.add_instruction(il.store(SLOT as usize, slot(il, model, depth + drop), value));
+    for nth in 0..unwind.keep {
+        let value = slot(il, model, from + nth, SLOT as usize);
+        set_slot(il, model, to + nth, SLOT as usize, value);
     }
-    pop(il, model, drop);
 }
 
-/// A calling convention cannot describe results on the operand stack, so the first one moves to the
-/// register [`crate::arch::WasmCallingConvention`] names; without this the callee computes its
-/// result and drops it, and the caller's value comes from nowhere
-fn leave(il: &LowLevelILMutableFunction, model: Model) {
-    // The first result, which is the deepest, since taking the top would hand a multi-value
-    // function's last result to the slot standing for its first
-    if let Some(depth) = model.frame.results.checked_sub(1) {
-        let result = peek(il, model, u64::from(depth), SLOT as usize);
-        il.add_instruction(il.set_reg(SLOT as usize, model.reg(RegKind::Rv), result));
+fn leave(il: &LowLevelILMutableFunction, model: Model, top: Option<u32>) {
+    let results = model.frame.results;
+    if !returnable(results) {
+        crowded(il);
     }
-    // `fp` is still this frame's own, so the slot the prologue wrote is a fixed distance from it
-    let saved = signed_offset_from(il, model, RegKind::Fp, -saved_frame(model));
-    let caller = il.expression(il.load(model.addr, saved));
-    il.add_instruction(il.set_reg(model.addr, model.reg(RegKind::Fp), caller));
-
-    let address = model.link(il);
-    il.add_instruction(il.ret(address));
+    let base = top
+        .and_then(|top| top.checked_sub(results.len() as u32))
+        .filter(|_| returnable(results));
+    ret_with(il, model.addr, results, |nth, width| match base {
+        Some(base) => slot(il, model, base + nth, width),
+        None => il.expression(il.undefined()),
+    });
 }
 
-fn go(il: &LowLevelILMutableFunction, model: Model, target: Option<u64>) {
+pub fn stub(il: &LowLevelILMutableFunction, pointer: usize, results: &[ValueKind]) {
+    ret_with(il, pointer, results, |_, _| il.expression(il.undefined()));
+}
+
+fn ret_with<'a>(
+    il: &'a LowLevelILMutableFunction,
+    pointer: usize,
+    results: &[ValueKind],
+    value: impl Fn(u32, usize) -> LowLevelILMutableExpression<'a, ValueExpr>,
+) {
+    for (nth, kind) in results.iter().enumerate().take(RESULT_REGISTERS as usize) {
+        let width = width(*kind, pointer);
+        let register = WasmRegister::sized(RegKind::Result(nth as u32), width, pointer);
+        il.add_instruction(il.set_reg(
+            width,
+            LowLevelILRegisterKind::Arch(register),
+            value(nth as u32, width),
+        ));
+    }
+    let link = LowLevelILRegisterKind::Arch(WasmRegister::new(RegKind::Lr, pointer));
+    il.add_instruction(il.ret(il.reg(pointer, link)));
+}
+
+fn go(il: &LowLevelILMutableFunction, model: Model, target: Option<u64>, top: Option<u32>) {
     let Some(to) = target else {
-        leave(il, model);
+        leave(il, model, top);
         return;
     };
 
@@ -619,9 +1048,9 @@ fn go(il: &LowLevelILMutableFunction, model: Model, target: Option<u64>) {
 
 const RESULT_I32: usize = 4;
 
-/// In slots, positive when the stack shrinks, and `None` where the lifter deliberately does not
-/// move it; the conformance harness checks this against a real validator, since moving the stack by
-/// the wrong amount silently corrupts every instruction after it
+/// In slots, positive when the stack shrinks, and `None` where control does not fall through or the
+/// effect is unknown; the conformance harness checks this against a real validator, since a wrong
+/// amount silently puts every instruction after it at the wrong height
 pub fn stack_effect(insn: &Instruction, resolved: Option<&Resolved>) -> Option<i64> {
     let net = |pops: i64, pushes: i64| Some(pops - pushes);
 
@@ -639,209 +1068,126 @@ pub fn stack_effect(insn: &Instruction, resolved: Option<&Resolved>) -> Option<i
                 .falls_through()
                 .then_some(i64::from(arity.pops) - i64::from(arity.pushes));
         }
-        Some(Resolved::Aggregate(arity)) => {
+        Some(Resolved::Aggregate(arity) | Resolved::Switching(arity)) => {
             return net(i64::from(arity.pops), i64::from(arity.pushes));
         }
+        Some(Resolved::Function(_)) => return net(0, 1),
         None => {}
     }
 
     match semantics(insn) {
         Sem::Nop => net(0, 0),
         Sem::Trap | Sem::Return => None,
-        Sem::Const { .. } | Sem::LocalGet(_) | Sem::GlobalGet(_) => net(0, 1),
+        Sem::Const { .. } | Sem::LocalGet(_) | Sem::GlobalGet(_) | Sem::Null => net(0, 1),
+        Sem::IsNull | Sem::TableGet => net(1, 1),
+        Sem::TableSet => net(2, 0),
         Sem::Unary { .. }
         | Sem::TestZero { .. }
         | Sem::Convert { .. }
+        | Sem::Saturate(_)
         | Sem::Load { .. }
         | Sem::LocalTee(_) => net(1, 1),
         Sem::Binary { .. } | Sem::Compare { .. } => net(2, 1),
         Sem::Store { .. } => net(2, 0),
         Sem::LocalSet(_) | Sem::GlobalSet(_) | Sem::Drop | Sem::CondBranch => net(1, 0),
         Sem::RefBranch => net(0, 0),
+        Sem::Select { values } => net(2 * i64::from(values) + 1, i64::from(values)),
         Sem::Aggregate { pops, pushes } => net(i64::from(pops), i64::from(pushes)),
-        Sem::Opaque if !insn.flow().falls_through() => None,
-        Sem::Opaque => {
-            let Arity { pops, pushes } = insn.arity()?;
-            net(i64::from(pops), i64::from(pushes))
+        Sem::Opaque | Sem::OtherMemory if !insn.flow().falls_through() => None,
+        Sem::Opaque | Sem::OtherMemory => {
+            let arity = insn.arity()?;
+            net(i64::from(arity.pops), i64::from(arity.pushes))
         }
     }
 }
 
-/// Everything without a modelled meaning still has a known stack effect, so the stack pointer stays
-/// honest and each produced value is marked undefined rather than silently reused
-fn opaque(il: &LowLevelILMutableFunction, model: Model, insn: &Instruction) {
-    if !insn.flow().falls_through() {
-        match insn.flow() {
-            Flow::Trap => il.add_instruction(il.no_ret()),
-            _ => il.add_instruction(il.unimplemented()),
-        }
-        return;
-    }
-
-    let (Some(arity), Some(operator)) = (insn.arity(), insn.operator_id()) else {
-        il.add_instruction(il.unimplemented());
+fn opaque(il: &LowLevelILMutableFunction, model: Model, insn: &Instruction, sem: Sem, height: u32) {
+    let (Some(arity), Some(operator), true) = (
+        insn.arity(),
+        insn.operator_id(),
+        insn.flow().falls_through(),
+    ) else {
+        give_up(il, model, insn, sem, None);
         return;
     };
 
     // Arguments were pushed in order, so the first one sits deepest
-    let slots = usize::try_from(arity.pops).unwrap_or(0);
-    let arguments: Vec<_> = (0..slots)
-        .map(|index| peek(il, model, (slots - 1 - index) as u64, SLOT as usize))
+    let base = height - arity.pops;
+    let outputs: Vec<_> = (0..arity.pushes)
+        .map(|nth| model.stack(base + nth, SLOT as usize))
         .collect();
-
-    let results: Vec<_> = (0..arity.pushes).map(temp).collect();
-
-    il.add_instruction(il.intrinsic(results.clone(), WasmIntrinsic(operator), arguments));
-
-    let net = i64::from(arity.pops) - i64::from(arity.pushes);
-    if net != 0 {
-        adjust_sp(il, model, net * SLOT as i64);
-    }
-
-    for (index, result) in results.into_iter().enumerate() {
-        let depth = (results_len(arity.pushes) - 1 - index) as u64;
-        let value = il.reg(SLOT as usize, result);
-        il.add_instruction(il.store(SLOT as usize, slot(il, model, depth), value));
-    }
+    let offset = memarg(&insn.op).map(|memarg| memarg.offset);
+    let inputs: Vec<_> = (0..arity.pops)
+        .map(|nth| match offset {
+            Some(offset) if nth == 0 => linear_address(il, model, base, offset),
+            _ => il.reg(SLOT as usize, model.stack(base + nth, SLOT as usize)),
+        })
+        .chain(
+            immediates(&insn.op)
+                .into_iter()
+                .map(|value| il.const_int(SLOT as usize, value)),
+        )
+        .collect();
+    il.add_instruction(il.intrinsic(outputs, model.intrinsic(operator), inputs));
 }
 
-fn results_len(pushes: u32) -> usize {
-    usize::try_from(pushes).unwrap_or(0)
-}
-
-fn slot(
-    il: &LowLevelILMutableFunction,
-    model: Model,
-    depth: u64,
-) -> LowLevelILMutableExpression<'_, ValueExpr> {
-    offset_from(il, model, RegKind::Sp, depth * SLOT)
-}
-
-fn frame_slot(
-    il: &LowLevelILMutableFunction,
+fn global_address<'a>(
+    il: &'a LowLevelILMutableFunction,
     model: Model,
     index: u32,
-) -> LowLevelILMutableExpression<'_, ValueExpr> {
-    signed_offset_from(il, model, RegKind::Fp, model.frame.offset(index))
+) -> LowLevelILMutableExpression<'a, ValueExpr> {
+    il.const_ptr_sized(model.addr, model.layout.global_address(index))
 }
 
-fn global_slot(
-    il: &LowLevelILMutableFunction,
+fn prologue(il: &LowLevelILMutableFunction, model: Model) {
+    let frame = model.frame;
+    for (index, kind) in frame.locals.iter().enumerate() {
+        let index = index as u32;
+        if index >= LOCAL_REGISTERS {
+            crowded_locals();
+            break;
+        }
+        let width = width(*kind, model.addr);
+        let value = if index >= frame.params {
+            il.const_int(width, 0)
+        } else if index < ARGUMENT_REGISTERS {
+            il.reg(width, model.argument(index, width))
+        } else {
+            il.expression(il.undefined())
+        };
+        il.add_instruction(il.set_reg(width, model.local(index, width), value));
+    }
+}
+
+fn linear_address<'a>(
+    il: &'a LowLevelILMutableFunction,
     model: Model,
     index: u32,
-) -> LowLevelILMutableExpression<'_, ValueExpr> {
-    il.const_ptr_sized(
-        model.addr,
-        model.global_base + u64::from(index) * crate::module::GLOBAL_STRIDE,
-    )
-}
-
-fn offset_from(
-    il: &LowLevelILMutableFunction,
-    model: Model,
-    reg: RegKind,
     offset: u64,
-) -> LowLevelILMutableExpression<'_, ValueExpr> {
-    let base = il.reg(model.addr, model.reg(reg));
-    if offset == 0 {
-        base
-    } else {
-        let delta = il.const_int(model.addr, offset);
-        il.expression(il.add(model.addr, base, delta))
-    }
-}
-
-fn signed_offset_from(
-    il: &LowLevelILMutableFunction,
-    model: Model,
-    reg: RegKind,
-    offset: i64,
-) -> LowLevelILMutableExpression<'_, ValueExpr> {
-    let base = il.reg(model.addr, model.reg(reg));
+) -> LowLevelILMutableExpression<'a, ValueExpr> {
+    let base = il.reg(model.addr, model.stack(index, model.addr));
     if offset == 0 {
         return base;
     }
-    let delta = il.const_int(model.addr, offset.unsigned_abs());
-    if offset < 0 {
-        il.expression(il.sub(model.addr, base, delta))
-    } else {
-        il.expression(il.add(model.addr, base, delta))
-    }
-}
-
-/// `fp` takes the stack pointer as the caller left it, which is what puts the parameters inside the
-/// frame the core tracks; without it a function reads as taking an opaque pointer and dereferencing
-/// it, and the prototype the module declares has nowhere to live
-fn prologue(il: &LowLevelILMutableFunction, model: Model) {
-    // The caller's own frame base goes just below where this one's locals will, since the
-    // convention calls `fp` callee saved and a caller's locals are addressed off it
-    let saved = signed_offset_from(il, model, RegKind::Sp, -saved_frame(model));
-    let caller = il.reg(model.addr, model.reg(RegKind::Fp));
-    il.add_instruction(il.store(model.addr, saved, caller));
-
-    let sp = il.reg(model.addr, model.reg(RegKind::Sp));
-    il.add_instruction(il.set_reg(model.addr, model.reg(RegKind::Fp), sp));
-    adjust_sp(il, model, -saved_frame(model));
-}
-
-fn saved_frame(model: Model) -> i64 {
-    model.frame.reserved() + SLOT as i64
-}
-
-fn peek(
-    il: &LowLevelILMutableFunction,
-    model: Model,
-    depth: u64,
-    size: usize,
-) -> LowLevelILMutableExpression<'_, ValueExpr> {
-    let address = slot(il, model, depth);
-    il.expression(il.load(size, address))
-}
-
-fn linear_address(
-    il: &LowLevelILMutableFunction,
-    model: Model,
-    depth: u64,
-    offset: u64,
-) -> LowLevelILMutableExpression<'_, ValueExpr> {
-    // The operand is an offset into linear memory rather than an address in the file, so adding
-    // the base memory is mapped at is what makes a load of a constant reach the bytes it reads
-    let base = peek(il, model, depth, model.addr);
     let delta = il.const_int(model.addr, offset);
     il.expression(il.add(model.addr, base, delta))
 }
 
-/// The stack grows down, as everywhere else, so the core's stack analysis reads the right way round
-fn push(il: &LowLevelILMutableFunction, model: Model) {
-    adjust_sp(il, model, -(SLOT as i64));
-}
-
-fn pop(il: &LowLevelILMutableFunction, model: Model, slots: u64) {
-    if slots != 0 {
-        adjust_sp(il, model, (slots * SLOT) as i64);
-    }
-}
-
-/// A scratch register with no architectural counterpart, for a value that has to pass through
-/// something nameable
-fn temp(index: u32) -> LowLevelILRegisterKind<WasmRegister> {
-    LowLevelILRegisterKind::Temp(LowLevelILTempRegister::new(index))
-}
-
-fn adjust_sp(il: &LowLevelILMutableFunction, model: Model, delta: i64) {
-    let sp = il.reg(model.addr, model.reg(RegKind::Sp));
-    let amount = il.const_int(model.addr, delta.unsigned_abs());
-    let updated = if delta < 0 {
-        il.sub(model.addr, sp, amount)
-    } else {
-        il.add(model.addr, sp, amount)
-    };
-    il.add_instruction(il.set_reg(model.addr, model.reg(RegKind::Sp), updated));
+fn table_slot<'a>(
+    il: &'a LowLevelILMutableFunction,
+    model: Model,
+    index: u32,
+) -> LowLevelILMutableExpression<'a, ValueExpr> {
+    let index = slot(il, model, index, model.addr);
+    let stride = il.const_int(model.addr, model.addr as u64);
+    let offset = il.expression(il.mul(model.addr, index, stride));
+    let table = il.const_ptr_sized(model.addr, model.layout.table_base);
+    il.expression(il.add(model.addr, table, offset))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// The only unary numeric operators are the floating point ones; integers reach the same effects
-/// through binary operators against a constant
+/// The floating point ones; `clz`, `ctz` and `popcnt` are intrinsics, and `eqz` and the extensions
+/// have semantics of their own
 enum Un {
     Neg,
     Abs,
@@ -900,11 +1246,8 @@ enum Conv {
     Wrap,
     SignExtend,
     ZeroExtend,
-    /// LLIL has no unsigned form, so the unsigned wasm operators lift to the signed one
-    FloatToInt,
-    IntToFloat {
-        signed: bool,
-    },
+    FloatToInt { signed: bool },
+    IntToFloat { signed: bool },
     FloatResize,
 }
 
@@ -919,6 +1262,10 @@ enum Extend {
 enum Sem {
     Nop,
     Trap,
+    Null,
+    IsNull,
+    TableGet,
+    TableSet,
     Return,
     Drop,
     Const {
@@ -945,6 +1292,7 @@ enum Sem {
         to: usize,
         kind: Conv,
     },
+    Saturate(&'static Saturating),
     Load {
         access: usize,
         result: usize,
@@ -957,8 +1305,11 @@ enum Sem {
         offset: u64,
     },
     CondBranch,
-    /// A reference test that branches, leaving its operand where it was
+    /// A reference test that branches, leaving its operand where it was on the fallthrough
     RefBranch,
+    Select {
+        values: u32,
+    },
     /// Moves a run of operands whose count is part of the instruction rather than the opcode
     Aggregate {
         pops: u32,
@@ -970,6 +1321,8 @@ enum Sem {
     GlobalGet(u32),
     GlobalSet(u32),
     Opaque,
+    /// A memory other than the first, which has no addresses in the view
+    OtherMemory,
 }
 
 fn unary<'a>(
@@ -1074,6 +1427,29 @@ fn compare<'a>(
     il.expression(il.bool_to_int(RESULT_I32, condition))
 }
 
+struct OtherWidth<'a>(LowLevelILMutableExpression<'a, ValueExpr>);
+
+impl<'a> LiftableLowLevelIL<'a> for OtherWidth<'a> {
+    type Result = ValueExpr;
+
+    fn lift(
+        _il: &'a LowLevelILMutableFunction,
+        expr: Self,
+    ) -> LowLevelILMutableExpression<'a, ValueExpr> {
+        expr.0
+    }
+}
+
+impl<'a> LiftableLowLevelILWithSize<'a> for OtherWidth<'a> {
+    fn lift_with_size(
+        _il: &'a LowLevelILMutableFunction,
+        expr: Self,
+        _size: usize,
+    ) -> LowLevelILMutableExpression<'a, ValueExpr> {
+        expr.0
+    }
+}
+
 fn convert<'a>(
     il: &'a LowLevelILMutableFunction,
     kind: Conv,
@@ -1085,29 +1461,32 @@ fn convert<'a>(
         Conv::Wrap => il.expression(il.low_part(to, value)),
         Conv::SignExtend => il.expression(il.sx(to, value)),
         Conv::ZeroExtend => il.expression(il.zx(to, value)),
-        Conv::FloatToInt => il.expression(il.float_to_int(to, value)),
-        Conv::IntToFloat { signed } => {
-            // The operand has to be as wide as the float it becomes, and this is where the
-            // operator's signedness lands: `f64.convert_i32_u` of `0xffffffff` is 4294967295
-            let widened = if from < to {
-                if signed {
-                    il.expression(il.sx(to, value))
-                } else {
-                    il.expression(il.zx(to, value))
-                }
-            } else {
-                value
-            };
+        Conv::FloatToInt { signed: true } => il.expression(il.float_to_int(to, OtherWidth(value))),
+        Conv::FloatToInt { signed: false } => {
+            let whole = il.expression(il.float_to_int(to * 2, OtherWidth(value)));
+            il.expression(il.low_part(to, whole))
+        }
+        Conv::IntToFloat { signed: true } if from < to => {
+            let widened = il.expression(il.sx(to, value));
             il.expression(il.int_to_float(to, widened))
         }
-        Conv::FloatResize => il.expression(il.float_conv(to, value)),
+        Conv::IntToFloat { signed: true } => il.expression(il.int_to_float(to, OtherWidth(value))),
+        Conv::IntToFloat { signed: false } => {
+            let widened = il.expression(il.zx(from * 2, value));
+            il.expression(il.int_to_float(to, OtherWidth(widened)))
+        }
+        Conv::FloatResize => il.expression(il.float_conv(to, OtherWidth(value))),
     }
 }
 
-/// Anything not named here is [`Sem::Opaque`] and is lifted from its stack effect alone, which
-/// covers the proposals whose values do not fit a scalar slot
+/// Anything not named here is [`Sem::Opaque`], lifted as an intrinsic named after the operator that
+/// takes its operands and immediates
 fn semantics(insn: &Instruction) -> Sem {
     use Operator as O;
+
+    if memarg(&insn.op).is_some_and(|memarg| memarg.memory != 0) {
+        return Sem::OtherMemory;
+    }
 
     match &insn.op {
         O::Nop => Sem::Nop,
@@ -1121,8 +1500,8 @@ fn semantics(insn: &Instruction) -> Sem {
         // way `end` does; the handlers are arms, reached along a throw edge
         O::Try { .. } | O::TryTable { .. } | O::Delegate { .. } => Sem::Nop,
 
-        // A reference test hands its operand to the label when it branches, and on the fallthrough
-        // `br_on_non_null` is the one that drops it
+        // On the fallthrough `br_on_non_null` drops its reference and the descriptor forms their
+        // descriptor, where the other reference tests leave the stack as it was
         O::BrOnNonNull { .. } | O::BrOnCastDescEq { .. } | O::BrOnCastDescEqFail { .. } => {
             Sem::CondBranch
         }
@@ -1134,14 +1513,11 @@ fn semantics(insn: &Instruction) -> Sem {
             pushes: 1,
         },
 
+        O::Select | O::TypedSelect { .. } => Sem::Select { values: 1 },
         // A multi-value `select` chooses between two runs of a shape the instruction spells out
-        O::TypedSelectMulti { tys } => {
-            let values = tys.len() as u32;
-            Sem::Aggregate {
-                pops: values.saturating_mul(2).saturating_add(1),
-                pushes: values,
-            }
-        }
+        O::TypedSelectMulti { tys } => Sem::Select {
+            values: u32::try_from(tys.len()).unwrap_or(u32::MAX),
+        },
 
         // The arity table calls these variable, since entering a block also moves its parameters,
         // but the condition on top is always there
@@ -1173,92 +1549,92 @@ fn semantics(insn: &Instruction) -> Sem {
         O::I32Eqz => Sem::TestZero { size: 4 },
         O::I64Eqz => Sem::TestZero { size: 8 },
 
-        O::I32Eq => int_compare(4, Cmp::Eq),
-        O::I32Ne => int_compare(4, Cmp::Ne),
-        O::I32LtS => int_compare(4, Cmp::LtS),
-        O::I32LtU => int_compare(4, Cmp::LtU),
-        O::I32GtS => int_compare(4, Cmp::GtS),
-        O::I32GtU => int_compare(4, Cmp::GtU),
-        O::I32LeS => int_compare(4, Cmp::LeS),
-        O::I32LeU => int_compare(4, Cmp::LeU),
-        O::I32GeS => int_compare(4, Cmp::GeS),
-        O::I32GeU => int_compare(4, Cmp::GeU),
-        O::I64Eq => int_compare(8, Cmp::Eq),
-        O::I64Ne => int_compare(8, Cmp::Ne),
-        O::I64LtS => int_compare(8, Cmp::LtS),
-        O::I64LtU => int_compare(8, Cmp::LtU),
-        O::I64GtS => int_compare(8, Cmp::GtS),
-        O::I64GtU => int_compare(8, Cmp::GtU),
-        O::I64LeS => int_compare(8, Cmp::LeS),
-        O::I64LeU => int_compare(8, Cmp::LeU),
-        O::I64GeS => int_compare(8, Cmp::GeS),
-        O::I64GeU => int_compare(8, Cmp::GeU),
-        O::F32Eq => int_compare(4, Cmp::FEq),
-        O::F32Ne => int_compare(4, Cmp::FNe),
-        O::F32Lt => int_compare(4, Cmp::FLt),
-        O::F32Gt => int_compare(4, Cmp::FGt),
-        O::F32Le => int_compare(4, Cmp::FLe),
-        O::F32Ge => int_compare(4, Cmp::FGe),
-        O::F64Eq => int_compare(8, Cmp::FEq),
-        O::F64Ne => int_compare(8, Cmp::FNe),
-        O::F64Lt => int_compare(8, Cmp::FLt),
-        O::F64Gt => int_compare(8, Cmp::FGt),
-        O::F64Le => int_compare(8, Cmp::FLe),
-        O::F64Ge => int_compare(8, Cmp::FGe),
+        O::I32Eq => compare_sem(4, Cmp::Eq),
+        O::I32Ne => compare_sem(4, Cmp::Ne),
+        O::I32LtS => compare_sem(4, Cmp::LtS),
+        O::I32LtU => compare_sem(4, Cmp::LtU),
+        O::I32GtS => compare_sem(4, Cmp::GtS),
+        O::I32GtU => compare_sem(4, Cmp::GtU),
+        O::I32LeS => compare_sem(4, Cmp::LeS),
+        O::I32LeU => compare_sem(4, Cmp::LeU),
+        O::I32GeS => compare_sem(4, Cmp::GeS),
+        O::I32GeU => compare_sem(4, Cmp::GeU),
+        O::I64Eq => compare_sem(8, Cmp::Eq),
+        O::I64Ne => compare_sem(8, Cmp::Ne),
+        O::I64LtS => compare_sem(8, Cmp::LtS),
+        O::I64LtU => compare_sem(8, Cmp::LtU),
+        O::I64GtS => compare_sem(8, Cmp::GtS),
+        O::I64GtU => compare_sem(8, Cmp::GtU),
+        O::I64LeS => compare_sem(8, Cmp::LeS),
+        O::I64LeU => compare_sem(8, Cmp::LeU),
+        O::I64GeS => compare_sem(8, Cmp::GeS),
+        O::I64GeU => compare_sem(8, Cmp::GeU),
+        O::F32Eq => compare_sem(4, Cmp::FEq),
+        O::F32Ne => compare_sem(4, Cmp::FNe),
+        O::F32Lt => compare_sem(4, Cmp::FLt),
+        O::F32Gt => compare_sem(4, Cmp::FGt),
+        O::F32Le => compare_sem(4, Cmp::FLe),
+        O::F32Ge => compare_sem(4, Cmp::FGe),
+        O::F64Eq => compare_sem(8, Cmp::FEq),
+        O::F64Ne => compare_sem(8, Cmp::FNe),
+        O::F64Lt => compare_sem(8, Cmp::FLt),
+        O::F64Gt => compare_sem(8, Cmp::FGt),
+        O::F64Le => compare_sem(8, Cmp::FLe),
+        O::F64Ge => compare_sem(8, Cmp::FGe),
 
-        O::I32Add => int_binary(4, Bin::Add),
-        O::I32Sub => int_binary(4, Bin::Sub),
-        O::I32Mul => int_binary(4, Bin::Mul),
-        O::I32DivS => int_binary(4, Bin::DivS),
-        O::I32DivU => int_binary(4, Bin::DivU),
-        O::I32RemS => int_binary(4, Bin::RemS),
-        O::I32RemU => int_binary(4, Bin::RemU),
-        O::I32And => int_binary(4, Bin::And),
-        O::I32Or => int_binary(4, Bin::Or),
-        O::I32Xor => int_binary(4, Bin::Xor),
-        O::I32Shl => int_binary(4, Bin::Shl),
-        O::I32ShrS => int_binary(4, Bin::ShrS),
-        O::I32ShrU => int_binary(4, Bin::ShrU),
-        O::I32Rotl => int_binary(4, Bin::Rotl),
-        O::I32Rotr => int_binary(4, Bin::Rotr),
-        O::I64Add => int_binary(8, Bin::Add),
-        O::I64Sub => int_binary(8, Bin::Sub),
-        O::I64Mul => int_binary(8, Bin::Mul),
-        O::I64DivS => int_binary(8, Bin::DivS),
-        O::I64DivU => int_binary(8, Bin::DivU),
-        O::I64RemS => int_binary(8, Bin::RemS),
-        O::I64RemU => int_binary(8, Bin::RemU),
-        O::I64And => int_binary(8, Bin::And),
-        O::I64Or => int_binary(8, Bin::Or),
-        O::I64Xor => int_binary(8, Bin::Xor),
-        O::I64Shl => int_binary(8, Bin::Shl),
-        O::I64ShrS => int_binary(8, Bin::ShrS),
-        O::I64ShrU => int_binary(8, Bin::ShrU),
-        O::I64Rotl => int_binary(8, Bin::Rotl),
-        O::I64Rotr => int_binary(8, Bin::Rotr),
-        O::F32Add => int_binary(4, Bin::FAdd),
-        O::F32Sub => int_binary(4, Bin::FSub),
-        O::F32Mul => int_binary(4, Bin::FMul),
-        O::F32Div => int_binary(4, Bin::FDiv),
-        O::F64Add => int_binary(8, Bin::FAdd),
-        O::F64Sub => int_binary(8, Bin::FSub),
-        O::F64Mul => int_binary(8, Bin::FMul),
-        O::F64Div => int_binary(8, Bin::FDiv),
+        O::I32Add => binary_sem(4, Bin::Add),
+        O::I32Sub => binary_sem(4, Bin::Sub),
+        O::I32Mul => binary_sem(4, Bin::Mul),
+        O::I32DivS => binary_sem(4, Bin::DivS),
+        O::I32DivU => binary_sem(4, Bin::DivU),
+        O::I32RemS => binary_sem(4, Bin::RemS),
+        O::I32RemU => binary_sem(4, Bin::RemU),
+        O::I32And => binary_sem(4, Bin::And),
+        O::I32Or => binary_sem(4, Bin::Or),
+        O::I32Xor => binary_sem(4, Bin::Xor),
+        O::I32Shl => binary_sem(4, Bin::Shl),
+        O::I32ShrS => binary_sem(4, Bin::ShrS),
+        O::I32ShrU => binary_sem(4, Bin::ShrU),
+        O::I32Rotl => binary_sem(4, Bin::Rotl),
+        O::I32Rotr => binary_sem(4, Bin::Rotr),
+        O::I64Add => binary_sem(8, Bin::Add),
+        O::I64Sub => binary_sem(8, Bin::Sub),
+        O::I64Mul => binary_sem(8, Bin::Mul),
+        O::I64DivS => binary_sem(8, Bin::DivS),
+        O::I64DivU => binary_sem(8, Bin::DivU),
+        O::I64RemS => binary_sem(8, Bin::RemS),
+        O::I64RemU => binary_sem(8, Bin::RemU),
+        O::I64And => binary_sem(8, Bin::And),
+        O::I64Or => binary_sem(8, Bin::Or),
+        O::I64Xor => binary_sem(8, Bin::Xor),
+        O::I64Shl => binary_sem(8, Bin::Shl),
+        O::I64ShrS => binary_sem(8, Bin::ShrS),
+        O::I64ShrU => binary_sem(8, Bin::ShrU),
+        O::I64Rotl => binary_sem(8, Bin::Rotl),
+        O::I64Rotr => binary_sem(8, Bin::Rotr),
+        O::F32Add => binary_sem(4, Bin::FAdd),
+        O::F32Sub => binary_sem(4, Bin::FSub),
+        O::F32Mul => binary_sem(4, Bin::FMul),
+        O::F32Div => binary_sem(4, Bin::FDiv),
+        O::F64Add => binary_sem(8, Bin::FAdd),
+        O::F64Sub => binary_sem(8, Bin::FSub),
+        O::F64Mul => binary_sem(8, Bin::FMul),
+        O::F64Div => binary_sem(8, Bin::FDiv),
 
-        O::F32Neg => int_unary(4, Un::Neg),
-        O::F32Abs => int_unary(4, Un::Abs),
-        O::F32Sqrt => int_unary(4, Un::Sqrt),
-        O::F32Ceil => int_unary(4, Un::Ceil),
-        O::F32Floor => int_unary(4, Un::Floor),
-        O::F32Trunc => int_unary(4, Un::Trunc),
-        O::F32Nearest => int_unary(4, Un::Nearest),
-        O::F64Neg => int_unary(8, Un::Neg),
-        O::F64Abs => int_unary(8, Un::Abs),
-        O::F64Sqrt => int_unary(8, Un::Sqrt),
-        O::F64Ceil => int_unary(8, Un::Ceil),
-        O::F64Floor => int_unary(8, Un::Floor),
-        O::F64Trunc => int_unary(8, Un::Trunc),
-        O::F64Nearest => int_unary(8, Un::Nearest),
+        O::F32Neg => unary_sem(4, Un::Neg),
+        O::F32Abs => unary_sem(4, Un::Abs),
+        O::F32Sqrt => unary_sem(4, Un::Sqrt),
+        O::F32Ceil => unary_sem(4, Un::Ceil),
+        O::F32Floor => unary_sem(4, Un::Floor),
+        O::F32Trunc => unary_sem(4, Un::Trunc),
+        O::F32Nearest => unary_sem(4, Un::Nearest),
+        O::F64Neg => unary_sem(8, Un::Neg),
+        O::F64Abs => unary_sem(8, Un::Abs),
+        O::F64Sqrt => unary_sem(8, Un::Sqrt),
+        O::F64Ceil => unary_sem(8, Un::Ceil),
+        O::F64Floor => unary_sem(8, Un::Floor),
+        O::F64Trunc => unary_sem(8, Un::Trunc),
+        O::F64Nearest => unary_sem(8, Un::Nearest),
 
         O::I32WrapI64 => convert_sem(8, 4, Conv::Wrap),
         O::I64ExtendI32S => convert_sem(4, 8, Conv::SignExtend),
@@ -1269,18 +1645,25 @@ fn semantics(insn: &Instruction) -> Sem {
         O::I64Extend16S => convert_sem(2, 8, Conv::SignExtend),
         O::I64Extend32S => convert_sem(4, 8, Conv::SignExtend),
 
-        O::I32TruncF32S | O::I32TruncF32U | O::I32TruncSatF32S | O::I32TruncSatF32U => {
-            convert_sem(4, 4, Conv::FloatToInt)
-        }
-        O::I32TruncF64S | O::I32TruncF64U | O::I32TruncSatF64S | O::I32TruncSatF64U => {
-            convert_sem(8, 4, Conv::FloatToInt)
-        }
-        O::I64TruncF32S | O::I64TruncF32U | O::I64TruncSatF32S | O::I64TruncSatF32U => {
-            convert_sem(4, 8, Conv::FloatToInt)
-        }
-        O::I64TruncF64S | O::I64TruncF64U | O::I64TruncSatF64S | O::I64TruncSatF64U => {
-            convert_sem(8, 8, Conv::FloatToInt)
-        }
+        O::I32TruncF32S => convert_sem(4, 4, float_to_int(true)),
+        O::I32TruncF32U => convert_sem(4, 4, float_to_int(false)),
+        O::I32TruncF64S => convert_sem(8, 4, float_to_int(true)),
+        O::I32TruncF64U => convert_sem(8, 4, float_to_int(false)),
+        O::I64TruncF32S => convert_sem(4, 8, float_to_int(true)),
+        O::I64TruncF32U => convert_sem(4, 8, float_to_int(false)),
+        O::I64TruncF64S => convert_sem(8, 8, float_to_int(true)),
+        O::I64TruncF64U => convert_sem(8, 8, float_to_int(false)),
+        O::I32TruncSatF32S
+        | O::I32TruncSatF32U
+        | O::I32TruncSatF64S
+        | O::I32TruncSatF64U
+        | O::I64TruncSatF32S
+        | O::I64TruncSatF32U
+        | O::I64TruncSatF64S
+        | O::I64TruncSatF64U => insn
+            .operator_id()
+            .and_then(saturating)
+            .map_or(Sem::Opaque, Sem::Saturate),
         O::F32ConvertI32S => convert_sem(4, 4, Conv::IntToFloat { signed: true }),
         O::F32ConvertI32U => convert_sem(4, 4, Conv::IntToFloat { signed: false }),
         O::F32ConvertI64S => convert_sem(8, 4, Conv::IntToFloat { signed: true }),
@@ -1323,20 +1706,76 @@ fn semantics(insn: &Instruction) -> Sem {
         O::I64Store16 { memarg } => store(2, 8, memarg.offset),
         O::I64Store32 { memarg } => store(4, 8, memarg.offset),
 
+        O::I32AtomicLoad { memarg } => load(4, 4, Extend::None, memarg.offset),
+        O::I64AtomicLoad { memarg } => load(8, 8, Extend::None, memarg.offset),
+        O::I32AtomicLoad8U { memarg } => load(1, 4, Extend::Zero, memarg.offset),
+        O::I32AtomicLoad16U { memarg } => load(2, 4, Extend::Zero, memarg.offset),
+        O::I64AtomicLoad8U { memarg } => load(1, 8, Extend::Zero, memarg.offset),
+        O::I64AtomicLoad16U { memarg } => load(2, 8, Extend::Zero, memarg.offset),
+        O::I64AtomicLoad32U { memarg } => load(4, 8, Extend::Zero, memarg.offset),
+        O::I32AtomicStore { memarg } => store(4, 4, memarg.offset),
+        O::I64AtomicStore { memarg } => store(8, 8, memarg.offset),
+        O::I32AtomicStore8 { memarg } => store(1, 4, memarg.offset),
+        O::I32AtomicStore16 { memarg } => store(2, 4, memarg.offset),
+        O::I64AtomicStore8 { memarg } => store(1, 8, memarg.offset),
+        O::I64AtomicStore16 { memarg } => store(2, 8, memarg.offset),
+        O::I64AtomicStore32 { memarg } => store(4, 8, memarg.offset),
+
+        O::RefNull { .. } => Sem::Null,
+        O::RefIsNull => Sem::IsNull,
+        O::TableGet { table: 0 } => Sem::TableGet,
+        O::TableSet { table: 0 } => Sem::TableSet,
+
         _ => Sem::Opaque,
     }
 }
 
-fn int_unary(size: usize, kind: Un) -> Sem {
+fn unary_sem(size: usize, kind: Un) -> Sem {
     Sem::Unary { size, kind }
 }
 
-fn int_binary(size: usize, kind: Bin) -> Sem {
+fn binary_sem(size: usize, kind: Bin) -> Sem {
     Sem::Binary { size, kind }
 }
 
-fn int_compare(size: usize, kind: Cmp) -> Sem {
+fn compare_sem(size: usize, kind: Cmp) -> Sem {
     Sem::Compare { size, kind }
+}
+
+fn float_to_int(signed: bool) -> Conv {
+    Conv::FloatToInt { signed }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Saturating {
+    pub id: u32,
+    pub from: usize,
+    pub to: usize,
+    pub signed: bool,
+}
+
+const SATURATING: [Saturating; 8] = [
+    saturating_from("visit_i32_trunc_sat_f32_s", 4, 4, true),
+    saturating_from("visit_i32_trunc_sat_f32_u", 4, 4, false),
+    saturating_from("visit_i32_trunc_sat_f64_s", 8, 4, true),
+    saturating_from("visit_i32_trunc_sat_f64_u", 8, 4, false),
+    saturating_from("visit_i64_trunc_sat_f32_s", 4, 8, true),
+    saturating_from("visit_i64_trunc_sat_f32_u", 4, 8, false),
+    saturating_from("visit_i64_trunc_sat_f64_s", 8, 8, true),
+    saturating_from("visit_i64_trunc_sat_f64_u", 8, 8, false),
+];
+
+const fn saturating_from(visitor: &str, from: usize, to: usize, signed: bool) -> Saturating {
+    Saturating {
+        id: crate::insn::stable_id(visitor),
+        from,
+        to,
+        signed,
+    }
+}
+
+pub fn saturating(id: u32) -> Option<&'static Saturating> {
+    SATURATING.iter().find(|conversion| conversion.id == id)
 }
 
 fn convert_sem(from: usize, to: usize, kind: Conv) -> Sem {
@@ -1363,31 +1802,98 @@ fn store(access: usize, value: usize, offset: u64) -> Sem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::insn::decode;
+    use crate::insn::{Arity, decode};
 
     fn sem(data: &[u8]) -> Sem {
         semantics(&decode(data).expect("decodes"))
     }
 
     #[test]
-    fn a_local_sits_where_the_frame_says() {
-        assert_eq!(local_slot(2, 0), 0);
-        assert_eq!(local_slot(2, 1), SLOT as i64);
-        assert_eq!(local_slot(2, 2), -(SLOT as i64));
-        assert_eq!(local_slot(2, 3), -2 * SLOT as i64);
-        assert_eq!(
-            local_slot(0, 0),
-            -(SLOT as i64),
-            "a body with no parameters"
+    fn only_memory_zero_is_read_as_memory() {
+        assert!(matches!(
+            sem(&[0x28, 0x02, 0x00]),
+            Sem::Load { access: 4, .. }
+        ));
+        assert!(
+            matches!(sem(&[0x28, 0x42, 0x01, 0x00]), Sem::OtherMemory),
+            "memory 1 is not mapped, so reading it as memory 0 would name the wrong bytes"
         );
+        assert!(matches!(
+            sem(&[0xfe, 0x10, 0x02, 0x00]),
+            Sem::Load { access: 4, .. }
+        ));
+        assert!(matches!(
+            sem(&[0xfe, 0x17, 0x02, 0x00]),
+            Sem::Store { access: 4, .. }
+        ));
+    }
 
-        let frame = Frame {
-            params: 2,
-            ..Frame::default()
-        };
-        for index in 0..4 {
-            assert_eq!(frame.offset(index), local_slot(2, index));
+    #[test]
+    fn references_and_the_first_table_are_values_and_slots() {
+        assert!(matches!(sem(&[0xd0, 0x70]), Sem::Null));
+        assert!(matches!(sem(&[0xd1]), Sem::IsNull));
+        assert!(matches!(sem(&[0x25, 0x00]), Sem::TableGet));
+        assert!(matches!(sem(&[0x26, 0x00]), Sem::TableSet));
+        assert!(
+            matches!(sem(&[0x25, 0x01]), Sem::Opaque),
+            "only table 0 has a region"
+        );
+        let function = Resolved::Function(0x1234);
+        assert_eq!(
+            stack_effect(&decode(&[0xd2, 0x00]).expect("decodes"), Some(&function)),
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn a_value_moves_at_the_width_of_its_type() {
+        assert_eq!(width(ValueKind::I32, 4), 4);
+        assert_eq!(width(ValueKind::F64, 4), 8);
+        assert_eq!(width(ValueKind::Ref, 4), 4);
+        assert_eq!(
+            width(ValueKind::Ref, 8),
+            8,
+            "a reference is a pointer in memory64"
+        );
+        assert_eq!(width(ValueKind::V128, 4), SLOT as usize);
+    }
+
+    #[test]
+    fn a_saturating_conversion_is_its_own_operator_rather_than_a_cast() {
+        let widths = [
+            (4, 4, true),
+            (4, 4, false),
+            (8, 4, true),
+            (8, 4, false),
+            (4, 8, true),
+            (4, 8, false),
+            (8, 8, true),
+            (8, 8, false),
+        ];
+        for (sub, (from, to, signed)) in (0u8..).zip(widths) {
+            let Sem::Saturate(conversion) = sem(&[0xfc, sub]) else {
+                panic!("0xfc {sub:#x} is not lifted as a saturating conversion");
+            };
+            assert_eq!(
+                (conversion.from, conversion.to, conversion.signed),
+                (from, to, signed)
+            );
+            let id = decode(&[0xfc, sub]).and_then(|insn| insn.operator_id());
+            assert_eq!(
+                Some(conversion.id),
+                id,
+                "the intrinsic is the operator's own"
+            );
         }
+        assert_eq!(
+            sem(&[0xa8]),
+            Sem::Convert {
+                from: 4,
+                to: 4,
+                kind: Conv::FloatToInt { signed: true }
+            },
+            "i32.trunc_f32_s traps instead, so no finished run sees a clamped value"
+        );
     }
 
     #[test]
@@ -1547,6 +2053,88 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_conversions_stay_unsigned() {
+        let unsigned = Conv::IntToFloat { signed: false };
+        assert_eq!(
+            sem(&[0xb3]),
+            convert_sem(4, 4, unsigned),
+            "f32.convert_i32_u"
+        );
+        assert_eq!(
+            sem(&[0xb5]),
+            convert_sem(8, 4, unsigned),
+            "f32.convert_i64_u"
+        );
+        assert_eq!(
+            sem(&[0xb8]),
+            convert_sem(4, 8, unsigned),
+            "f64.convert_i32_u"
+        );
+        assert_eq!(
+            sem(&[0xba]),
+            convert_sem(8, 8, unsigned),
+            "f64.convert_i64_u"
+        );
+        assert_eq!(
+            sem(&[0xa9]),
+            convert_sem(4, 4, float_to_int(false)),
+            "i32.trunc_f32_u"
+        );
+        assert_eq!(
+            sem(&[0xab]),
+            convert_sem(8, 4, float_to_int(false)),
+            "i32.trunc_f64_u"
+        );
+        assert_eq!(
+            sem(&[0xaa]),
+            convert_sem(8, 4, float_to_int(true)),
+            "i32.trunc_f64_s"
+        );
+        assert_eq!(
+            sem(&[0xb1]),
+            convert_sem(8, 8, float_to_int(false)),
+            "i64.trunc_f64_u"
+        );
+    }
+
+    #[test]
+    fn select_chooses_between_runs_of_values() {
+        assert_eq!(sem(&[0x1b]), Sem::Select { values: 1 });
+        assert_eq!(sem(&[0x1c, 0x01, 0x7f]), Sem::Select { values: 1 });
+        let select = decode(&[0x1b]).expect("select decodes");
+        assert_eq!(stack_effect(&select, None), Some(2));
+        assert_eq!(demand_alone(&select), (3, 1));
+    }
+
+    fn demand_alone(insn: &Instruction) -> (u32, u32) {
+        demand(insn, semantics(insn), None)
+    }
+
+    fn fits_alone(insn: &Instruction, height: u32) -> bool {
+        fits(insn, semantics(insn), None, height)
+    }
+
+    #[test]
+    fn a_branch_that_tests_the_top_needs_it_there() {
+        let br_if = decode(&[0x0d, 0x00]).expect("br_if decodes");
+        assert_eq!(demand_alone(&br_if).0, 1);
+        assert!(!fits_alone(&br_if, 0));
+        assert!(fits_alone(&br_if, 1));
+        let br_table = decode(&[0x0e, 0x00, 0x00]).expect("br_table decodes");
+        assert_eq!(demand_alone(&br_table).0, 1);
+    }
+
+    #[test]
+    fn an_operand_stack_deeper_than_the_register_file_does_not_fit() {
+        let push = decode(&[0x41, 0x00]).expect("i32.const decodes");
+        assert!(fits_alone(&push, STACK_REGISTERS - 1));
+        assert!(!fits_alone(&push, STACK_REGISTERS));
+        let add = decode(&[0x6a]).expect("i32.add decodes");
+        assert!(fits_alone(&add, STACK_REGISTERS));
+        assert!(!fits_alone(&add, 1), "a binary operator needs two operands");
+    }
+
+    #[test]
     fn no_op_semantics() {
         for encoding in [
             &[0xbc][..],
@@ -1579,42 +2167,69 @@ mod tests {
     }
 
     #[test]
-    fn parameters_sit_where_the_caller_left_them() {
-        let frame = Frame {
-            params: 3,
-            locals: 5,
-            results: 1,
-            result: Some(ValueKind::I32),
-            entry: false,
-        };
-        assert_eq!(frame.offset(0), 0);
-        assert_eq!(frame.offset(1), SLOT as i64);
-        assert_eq!(frame.offset(2), 2 * SLOT as i64);
-        // The two the body declared go below the base, in the space the prologue reserves
-        assert_eq!(frame.offset(3), -(SLOT as i64));
-        assert_eq!(frame.offset(4), -2 * (SLOT as i64));
-        assert_eq!(frame.reserved(), 2 * SLOT as i64);
-    }
-
-    #[test]
-    fn a_frame_with_no_parameters_reserves_all_of_its_locals() {
-        let frame = Frame {
-            params: 0,
-            locals: 2,
-            results: 0,
-            result: None,
-            entry: true,
-        };
-        assert_eq!(frame.offset(0), -(SLOT as i64));
-        assert_eq!(frame.offset(1), -2 * (SLOT as i64));
-        assert_eq!(frame.reserved(), 2 * SLOT as i64);
-        assert_eq!(Frame::default().reserved(), 0);
-    }
-
-    #[test]
     fn conditional_branches_still_consume_their_condition() {
         assert_eq!(sem(&[0x04, 0x40]), Sem::CondBranch);
         assert_eq!(sem(&[0x0d, 0x00]), Sem::CondBranch);
+    }
+
+    #[test]
+    fn a_taken_branch_leaves_only_what_its_label_receives() {
+        let (from_ref_type, to_ref_type) =
+            (wasmparser::RefType::ANYREF, wasmparser::RefType::EQREF);
+        let relative_depth = 0;
+        let cases = [
+            (Operator::BrIf { relative_depth }, 1, "the condition"),
+            (
+                Operator::BrOnNull { relative_depth },
+                1,
+                "the null reference",
+            ),
+            (
+                Operator::BrOnNonNull { relative_depth },
+                0,
+                "the reference is carried",
+            ),
+            (
+                Operator::BrOnCast {
+                    relative_depth,
+                    from_ref_type,
+                    to_ref_type,
+                },
+                0,
+                "the cast reference is carried",
+            ),
+            (
+                Operator::BrOnCastFail {
+                    relative_depth,
+                    from_ref_type,
+                    to_ref_type,
+                },
+                0,
+                "the reference is carried",
+            ),
+            (
+                Operator::BrOnCastDescEq {
+                    relative_depth,
+                    from_ref_type,
+                    to_ref_type,
+                },
+                1,
+                "the descriptor",
+            ),
+            (
+                Operator::BrOnCastDescEqFail {
+                    relative_depth,
+                    from_ref_type,
+                    to_ref_type,
+                },
+                1,
+                "the descriptor",
+            ),
+        ];
+        for (op, pops, what) in cases {
+            assert_eq!(taken_pops(&op), pops, "{op:?}: {what}");
+            assert_eq!(crate::insn::conditional_label(&op), Some(relative_depth));
+        }
     }
 
     #[test]
@@ -1651,8 +2266,6 @@ mod tests {
                 "call",
                 "call_indirect",
                 "call_ref",
-                "catch",
-                "catch_all",
                 "cont.bind",
                 "resume",
                 "resume_throw",
@@ -1675,7 +2288,8 @@ mod tests {
             target: Some(0x100),
             arity: Arity { pops: 2, pushes: 1 },
             params: vec![ValueKind::I32, ValueKind::I32],
-            result: Some(ValueKind::I32),
+            results: vec![ValueKind::I32],
+            returns_argument: false,
         });
         assert_eq!(stack_effect(&call, Some(&takes_two)), Some(1));
 
@@ -1685,6 +2299,20 @@ mod tests {
         // A tail call replaces the frame, so nothing is left to measure
         let tail = decode(&[0x12, 0x00]).expect("return_call decodes");
         assert_eq!(stack_effect(&tail, Some(&takes_two)), None);
+    }
+
+    #[test]
+    fn switching_stacks_is_measured_by_what_the_module_resolves() {
+        let suspend = decode(&[0xe2, 0x00]).expect("suspend decodes");
+        assert_eq!(suspend.mnemonic(), "suspend");
+        assert_eq!(stack_effect(&suspend, None), None);
+
+        let switching = Resolved::Switching(Arity { pops: 2, pushes: 1 });
+        assert_eq!(stack_effect(&suspend, Some(&switching)), Some(1));
+        let sem = semantics(&suspend);
+        assert_eq!(demand(&suspend, sem, Some(&switching)), (2, 1));
+        assert!(fits(&suspend, sem, Some(&switching), 2));
+        assert!(!fits(&suspend, sem, Some(&switching), 1));
     }
 
     #[test]
@@ -1711,12 +2339,7 @@ mod tests {
 
     #[test]
     fn unmodelled_operators_are_opaque() {
-        for encoding in [
-            &[0xfd, 0x6e][..], // i8x16.add
-            &[0x10, 0x00],     // call
-            &[0x1b],           // select
-            &[0xfc, 0x0a, 0x00, 0x00],
-        ] {
+        for encoding in [&[0xfd, 0x6e][..], &[0x10, 0x00], &[0xfc, 0x0a, 0x00, 0x00]] {
             assert_eq!(sem(encoding), Sem::Opaque, "{encoding:02x?}");
         }
     }

@@ -3,12 +3,13 @@
 //! A branch names a label relative to its enclosing block, so where it goes is the end of the
 //! frame that label names, or the top of the body for a `loop`
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{LazyLock, RwLock};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
-use wasmparser::{BlockType, Operator};
+use wasmparser::{BlockType, Catch, Handle, Operator};
 
 use crate::ViewId;
+use crate::arch::CAUGHT_REGISTERS;
 use crate::insn;
 use crate::lift;
 use crate::module::Module;
@@ -16,19 +17,24 @@ use crate::module::Module;
 /// Bodies whose operand stack went below empty, by where their code starts
 static UNBALANCED: LazyLock<RwLock<BTreeSet<(ViewId, u64)>>> = LazyLock::new(Default::default);
 
+pub fn forget(view: ViewId) {
+    let mut unbalanced = UNBALANCED.write().unwrap_or_else(PoisonError::into_inner);
+    unbalanced.retain(|(owner, _)| *owner != view);
+    let mut recovered = RECOVERED.write().unwrap_or_else(PoisonError::into_inner);
+    recovered.retain(|(_, owner), _| *owner != view);
+    let mut dispatch = DISPATCH.write().unwrap_or_else(PoisonError::into_inner);
+    dispatch.retain(|(_, owner), _| *owner != view);
+    let mut heights = HEIGHTS.write().unwrap_or_else(PoisonError::into_inner);
+    heights.retain(|(owner, _), _| *owner != view);
+}
+
 pub fn note_unbalanced(view: ViewId, start: u64) {
-    let mut unbalanced = match UNBALANCED.write() {
-        Ok(unbalanced) => unbalanced,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut unbalanced = UNBALANCED.write().unwrap_or_else(PoisonError::into_inner);
     unbalanced.insert((view, start));
 }
 
 pub fn is_unbalanced(view: ViewId, start: u64) -> bool {
-    let unbalanced = match UNBALANCED.read() {
-        Ok(unbalanced) => unbalanced,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let unbalanced = UNBALANCED.read().unwrap_or_else(PoisonError::into_inner);
     unbalanced.contains(&(view, start))
 }
 
@@ -40,50 +46,146 @@ pub fn is_unbalanced(view: ViewId, start: u64) -> bool {
 static RECOVERED: LazyLock<RwLock<BTreeMap<(u64, ViewId), Recovered>>> =
     LazyLock::new(Default::default);
 
-pub fn install(view: ViewId, flow: &ControlFlow) {
-    let mut recovered = match RECOVERED.write() {
-        Ok(recovered) => recovered,
-        // The map is a cache, so a poisoned lock is better carried on with than propagated
-        Err(poisoned) => poisoned.into_inner(),
-    };
+static DISPATCH: LazyLock<RwLock<BTreeMap<(u64, ViewId), Dispatch>>> =
+    LazyLock::new(Default::default);
 
-    let stale: Vec<(u64, ViewId)> = recovered
+#[derive(Debug)]
+struct Heights {
+    end: u64,
+    at: Vec<(u64, Option<u32>)>,
+}
+
+static HEIGHTS: LazyLock<RwLock<BTreeMap<(ViewId, u64), Heights>>> =
+    LazyLock::new(Default::default);
+
+fn install_heights(view: ViewId, flow: &ControlFlow) {
+    let at = flow
+        .instructions
+        .iter()
+        .zip(&flow.heights)
+        .map(|((addr, _), height)| (*addr, height.and_then(|height| u32::try_from(height).ok())))
+        .collect();
+    let mut heights = HEIGHTS.write().unwrap_or_else(PoisonError::into_inner);
+    let stale: Vec<(ViewId, u64)> = heights
+        .range((view, flow.start)..(view, flow.end))
+        .map(|(key, _)| *key)
+        .collect();
+    for key in stale {
+        heights.remove(&key);
+    }
+    heights.insert((view, flow.start), Heights { end: flow.end, at });
+}
+
+fn height_in(
+    heights: &BTreeMap<(ViewId, u64), Heights>,
+    view: ViewId,
+    addr: u64,
+) -> Option<Option<u32>> {
+    let (_, found) = heights.range((view, 0)..=(view, addr)).next_back()?;
+    if addr >= found.end {
+        return None;
+    }
+    let index = found.at.binary_search_by_key(&addr, |(at, _)| *at).ok()?;
+    Some(found.at[index].1)
+}
+
+pub fn height(view: ViewId, addr: u64) -> Option<u32> {
+    let heights = HEIGHTS.read().unwrap_or_else(PoisonError::into_inner);
+    height_in(&heights, view, addr).flatten()
+}
+
+pub fn height_anywhere(addr: u64) -> Option<u32> {
+    let heights = HEIGHTS.read().unwrap_or_else(PoisonError::into_inner);
+    let mut answer = None;
+    let mut view = heights.keys().next().map(|(view, _)| *view);
+    while let Some(current) = view {
+        if let Some(height) = height_in(&heights, current, addr) {
+            if answer.is_some_and(|seen| seen != height) {
+                return None;
+            }
+            answer = Some(height);
+        }
+        view = current
+            .checked_add(1)
+            .and_then(|next| heights.range((next, 0)..).next())
+            .map(|((view, _), _)| *view);
+    }
+    answer.flatten()
+}
+
+pub fn install(view: ViewId, flow: &ControlFlow) {
+    install_heights(view, flow);
+    // The map is a cache, so a poisoned lock is better carried on with than propagated
+    let mut recovered = RECOVERED.write().unwrap_or_else(PoisonError::into_inner);
+    replace(
+        &mut recovered,
+        view,
+        flow,
+        flow.terminators.iter().map(|(addr, terminator)| {
+            (
+                *addr,
+                Recovered {
+                    terminator: terminator.clone(),
+                    unwinds: flow.unwinds.get(addr).cloned().unwrap_or_default(),
+                },
+            )
+        }),
+    );
+    let mut dispatch = DISPATCH.write().unwrap_or_else(PoisonError::into_inner);
+    replace(
+        &mut dispatch,
+        view,
+        flow,
+        flow.dispatch
+            .iter()
+            .map(|(addr, dispatch)| (*addr, dispatch.clone())),
+    );
+}
+
+fn replace<T>(
+    map: &mut BTreeMap<(u64, ViewId), T>,
+    view: ViewId,
+    flow: &ControlFlow,
+    entries: impl Iterator<Item = (u64, T)>,
+) {
+    let stale: Vec<(u64, ViewId)> = map
         .range((flow.start, ViewId::MIN)..(flow.end, ViewId::MIN))
         .map(|(key, _)| *key)
         .filter(|(_, owner)| *owner == view)
         .collect();
     for key in stale {
-        recovered.remove(&key);
+        map.remove(&key);
     }
-    for (addr, terminator) in &flow.terminators {
-        recovered.insert(
-            (*addr, view),
-            Recovered {
-                terminator: terminator.clone(),
-                unwinds: flow.unwinds.get(addr).cloned().unwrap_or_default(),
-            },
-        );
+    for (addr, entry) in entries {
+        map.insert((addr, view), entry);
     }
 }
 
 pub fn lookup(view: ViewId, addr: u64) -> Option<Recovered> {
-    let recovered = match RECOVERED.read() {
-        Ok(recovered) => recovered,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let recovered = RECOVERED.read().unwrap_or_else(PoisonError::into_inner);
     recovered.get(&(addr, view)).cloned()
+}
+
+pub fn dispatch(view: ViewId, addr: u64) -> Option<Dispatch> {
+    let dispatch = DISPATCH.read().unwrap_or_else(PoisonError::into_inner);
+    dispatch.get(&(addr, view)).cloned()
 }
 
 /// For the callbacks handed an address and no file: answering only when every file that knows the
 /// address agrees is exact for one open file and silent rather than wrong for two
 pub fn lookup_anywhere(addr: u64) -> Option<Recovered> {
-    let recovered = match RECOVERED.read() {
-        Ok(recovered) => recovered,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let recovered = RECOVERED.read().unwrap_or_else(PoisonError::into_inner);
+    agreed(&recovered, addr)
+}
 
-    let mut found: Option<&Recovered> = None;
-    for (_, entry) in recovered.range((addr, ViewId::MIN)..=(addr, ViewId::MAX)) {
+pub fn dispatch_anywhere(addr: u64) -> Option<Dispatch> {
+    let dispatch = DISPATCH.read().unwrap_or_else(PoisonError::into_inner);
+    agreed(&dispatch, addr)
+}
+
+fn agreed<T: Clone + PartialEq>(map: &BTreeMap<(u64, ViewId), T>, addr: u64) -> Option<T> {
+    let mut found: Option<&T> = None;
+    for (_, entry) in map.range((addr, ViewId::MIN)..=(addr, ViewId::MAX)) {
         match found {
             Some(seen) if seen != entry => return None,
             _ => found = Some(entry),
@@ -112,15 +214,17 @@ pub enum Terminator {
     ConditionalReturn {
         not_taken: u64,
     },
-    /// Traps and throws, which have no successor inside the function
+    /// Traps and throws, which never fall through; where a throw lands is its [`Dispatch`]
     Halt,
+    Suspend {
+        handlers: Vec<(u32, Option<u64>)>,
+        next: u64,
+    },
     /// A target that could not be recovered, reported as such rather than guessed at
     Unresolved,
 }
 
-/// Branching out of a block unwinds it, and leaving that out has the two edges meet again holding
-/// different stack pointers, which puts every slot addressed off `sp` past that point out by the
-/// difference
+/// Branching out of a block unwinds it
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Unwind {
     /// Values carried to the label, which move down over the discarded slots
@@ -136,9 +240,144 @@ impl Unwind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Clause {
+    pub tag: Option<u32>,
+    pub target: Option<u64>,
+    pub base: Option<i64>,
+    pub carried: u32,
+    pub exnref: bool,
+    pub keeps: Option<u32>,
+    pub restores: Option<u32>,
+}
+
+struct Handlers {
+    clauses: Vec<Clause>,
+    by_tag: HashMap<u32, usize>,
+    unknown: bool,
+    outer: Option<Arc<Handlers>>,
+}
+
+impl Handlers {
+    fn chain(&self) -> impl Iterator<Item = &Handlers> {
+        std::iter::successors(Some(self), |handlers| handlers.outer.as_deref())
+    }
+
+    fn catching(&self, tag: u32) -> &[Clause] {
+        match self.by_tag.get(&tag) {
+            Some(&at) => std::slice::from_ref(&self.clauses[at]),
+            None => match self.clauses.last() {
+                Some(all) if all.tag.is_none() => std::slice::from_ref(all),
+                _ => &[],
+            },
+        }
+    }
+}
+
+impl Drop for Handlers {
+    fn drop(&mut self) {
+        let mut outer = self.outer.take();
+        while let Some(next) = outer {
+            outer = Arc::into_inner(next).and_then(|mut handlers| handlers.outer.take());
+        }
+    }
+}
+
+impl PartialEq for Handlers {
+    fn eq(&self, other: &Self) -> bool {
+        let (mut left, mut right) = (self.chain(), other.chain());
+        loop {
+            match (left.next(), right.next()) {
+                (None, None) => return true,
+                (Some(ours), Some(theirs)) if std::ptr::eq(ours, theirs) => return true,
+                (Some(ours), Some(theirs))
+                    if ours.clauses == theirs.clauses && ours.unknown == theirs.unknown => {}
+                _ => return false,
+            }
+        }
+    }
+}
+
+impl Eq for Handlers {}
+
+impl std::fmt::Debug for Handlers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(
+                self.chain()
+                    .map(|handlers| (&handlers.clauses, handlers.unknown)),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Dispatch {
+    pub tag: Option<u32>,
+    pub carried: u32,
+    pub caught: Option<u32>,
+    handlers: Option<Arc<Handlers>>,
+}
+
+pub struct Offered<'a> {
+    pub clauses: Vec<&'a Clause>,
+    pub truncated: bool,
+}
+
+impl Dispatch {
+    pub fn offered(&self) -> Offered<'_> {
+        let mut offered = Offered {
+            clauses: Vec::new(),
+            truncated: false,
+        };
+        let mut seen = HashSet::new();
+        let mut examined = 0usize;
+        let mut exhausted = || {
+            examined += 1;
+            examined > MAX_SEARCH
+        };
+        for handlers in self.handlers.iter().flat_map(|handlers| handlers.chain()) {
+            if exhausted() || handlers.unknown {
+                offered.truncated = true;
+                return offered;
+            }
+            let candidates = match self.tag {
+                Some(tag) => handlers.catching(tag),
+                None => &handlers.clauses[..],
+            };
+            for clause in candidates {
+                if exhausted() {
+                    offered.truncated = true;
+                    return offered;
+                }
+                if clause.tag.is_some_and(|tag| !seen.insert(tag)) {
+                    continue;
+                }
+                offered.clauses.push(clause);
+                if clause.tag.is_none() || self.tag.is_some() {
+                    return offered;
+                }
+            }
+        }
+        offered
+    }
+
+    fn landings(&self, visited: &mut HashSet<*const Handlers>) -> Vec<u64> {
+        let mut landings = Vec::new();
+        for handlers in self.handlers.iter().flat_map(|handlers| handlers.chain()) {
+            if !visited.insert(std::ptr::from_ref(handlers)) {
+                break;
+            }
+            landings.extend(handlers.clauses.iter().filter_map(|clause| clause.target));
+        }
+        landings
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recovered {
     pub terminator: Terminator,
-    /// One per edge that can unwind: a branch's taken edge, or every table entry then its default
+    /// One per edge that can unwind: a branch's taken edge, every table entry then its default, or
+    /// every handler of a resume
     pub unwinds: Vec<Unwind>,
 }
 
@@ -183,6 +422,7 @@ pub struct ControlFlow {
     /// No module an engine would load can go below empty, so the file was built by hand and its
     /// declared signature is a claim rather than a fact
     pub underflow: bool,
+    pub dispatch: BTreeMap<u64, Dispatch>,
 }
 
 impl ControlFlow {
@@ -203,26 +443,6 @@ impl ControlFlow {
                 .is_ok()
     }
 
-    /// The core makes functions mid-body, and recovering from there cannot work: a `br 4` needs
-    /// five enclosing frames and a mid-body walk has one, so walk the whole body then cut
-    pub fn restricted_to(mut self, start: u64) -> Self {
-        if start <= self.start {
-            return self;
-        }
-
-        let kept = self
-            .instructions
-            .iter()
-            .position(|(at, _)| *at >= start)
-            .unwrap_or(self.instructions.len());
-        self.instructions.drain(..kept);
-        self.heights.drain(..kept.min(self.heights.len()));
-        self.terminators.retain(|at, _| *at >= start);
-        self.unwinds.retain(|at, _| *at >= start);
-        self.start = start;
-        self
-    }
-
     /// A block starts at the entry, at any branch target, and after any instruction that does not
     /// fall into the next one
     pub fn blocks(&self) -> Vec<Block> {
@@ -231,6 +451,11 @@ impl ControlFlow {
         }
 
         let mut leaders = BTreeSet::from([self.start]);
+        leaders.extend(
+            self.handlers()
+                .into_iter()
+                .filter(|target| self.contains(*target)),
+        );
         for (addr, terminator) in &self.terminators {
             for target in terminator.targets() {
                 if self.contains(target) {
@@ -267,6 +492,51 @@ impl ControlFlow {
                 end: boundaries.get(index + 1).copied().unwrap_or(self.end),
                 edges: last[index].map_or_else(Vec::new, |at| self.edges_leaving(at)),
             })
+            .collect()
+    }
+
+    fn handlers(&self) -> BTreeSet<u64> {
+        let mut visited = HashSet::new();
+        self.dispatch
+            .values()
+            .flat_map(|dispatch| dispatch.landings(&mut visited))
+            .collect()
+    }
+
+    pub fn reachable_blocks(&self) -> Vec<Block> {
+        let blocks = self.blocks();
+        if self.truncated {
+            return blocks;
+        }
+        let by_start: BTreeMap<u64, usize> = blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.start, index))
+            .collect();
+        let mut reached = vec![false; blocks.len()];
+        let mut pending = vec![self.start];
+        let mut visited = HashSet::new();
+        while let Some(at) = pending.pop() {
+            let Some(&index) = by_start.get(&at) else {
+                continue;
+            };
+            if std::mem::replace(&mut reached[index], true) {
+                continue;
+            }
+            let block = &blocks[index];
+            for dispatch in self.dispatch.range(block.start..block.end).map(|(_, d)| d) {
+                pending.extend(dispatch.landings(&mut visited));
+            }
+            for edge in &block.edges {
+                if let Edge::Unconditional(to) | Edge::True(to) | Edge::False(to) = edge {
+                    pending.push(*to);
+                }
+            }
+        }
+        blocks
+            .into_iter()
+            .zip(reached)
+            .filter_map(|(block, reached)| reached.then_some(block))
             .collect()
     }
 
@@ -309,31 +579,24 @@ impl Terminator {
                 .filter_map(|to| *to)
                 .collect(),
             Self::ConditionalReturn { not_taken } => vec![*not_taken],
+            Self::Suspend { handlers, next } => handlers
+                .iter()
+                .filter_map(|(_, to)| *to)
+                .chain([*next])
+                .collect(),
             Self::Return | Self::Halt | Self::Unresolved => Vec::new(),
         }
     }
 
-    fn edges(&self) -> Vec<Edge> {
+    pub(crate) fn edges(&self) -> Vec<Edge> {
         match self {
             Self::Jump(target) => vec![Edge::Unconditional(*target)],
             Self::Branch { taken, not_taken } => {
                 vec![Edge::True(*taken), Edge::False(*not_taken)]
             }
-            Self::Table { targets, default } => {
-                let mut seen = BTreeSet::new();
-                let mut leaves = false;
-                let mut edges = Vec::new();
-                for target in targets.iter().chain([default]) {
-                    match target {
-                        Some(to) if seen.insert(*to) => edges.push(Edge::Unconditional(*to)),
-                        Some(_) => {}
-                        None => leaves = true,
-                    }
-                }
-                if leaves {
-                    edges.push(Edge::FunctionReturn);
-                }
-                edges
+            Self::Table { targets, default } => many_ways(targets.iter().chain([default]).copied()),
+            Self::Suspend { handlers, next } => {
+                many_ways(handlers.iter().map(|(_, to)| *to).chain([Some(*next)]))
             }
             Self::ConditionalReturn { not_taken } => {
                 vec![Edge::FunctionReturn, Edge::False(*not_taken)]
@@ -345,6 +608,23 @@ impl Terminator {
     }
 }
 
+fn many_ways(targets: impl Iterator<Item = Option<u64>>) -> Vec<Edge> {
+    let mut seen = BTreeSet::new();
+    let mut leaves = false;
+    let mut edges = Vec::new();
+    for target in targets {
+        match target {
+            Some(to) if seen.insert(to) => edges.push(Edge::Unconditional(to)),
+            Some(_) => {}
+            None => leaves = true,
+        }
+    }
+    if leaves {
+        edges.push(Edge::FunctionReturn);
+    }
+    edges
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameKind {
     /// The implicit block around the whole body, so branching to it is a return
@@ -353,6 +633,7 @@ enum FrameKind {
     Loop,
     If,
     Try,
+    TryTable,
 }
 
 #[derive(Debug)]
@@ -370,9 +651,54 @@ struct Frame {
     label_arity: u32,
     params: u32,
     results: u32,
+    catches: Vec<(Option<u32>, u64)>,
+    handling: Option<Option<u32>>,
+    delegate: Option<Option<usize>>,
+    clauses: Vec<(Option<u32>, bool, usize)>,
+    unresolved: bool,
+    nesting: u32,
+    outside: Option<usize>,
+    protecting: Option<usize>,
+}
+
+struct Protection {
+    frame: usize,
+    outer: Option<usize>,
+}
+
+#[derive(Default)]
+struct Protections {
+    chain: Vec<Protection>,
+    head: Option<usize>,
+}
+
+impl Protections {
+    fn enter(&mut self, frames: &mut [Frame], frame: usize) {
+        self.chain.push(Protection {
+            frame,
+            outer: self.head,
+        });
+        self.head = Some(self.chain.len() - 1);
+        frames[frame].protecting = self.head;
+    }
+
+    fn leave(&mut self, frames: &mut [Frame], frame: usize) {
+        if let Some(node) = frames[frame].protecting.take() {
+            self.head = self.chain[node].outer;
+        }
+    }
 }
 
 impl Frame {
+    /// A `loop` label restarts the body; everything else lands after its matching `end`
+    fn label(&self) -> Option<u64> {
+        match self.kind {
+            FrameKind::Loop => Some(self.body),
+            FrameKind::Function => None,
+            _ => self.end,
+        }
+    }
+
     /// Where the frame's `end` falls through to whatever encloses it
     fn end_height(&self) -> Option<i64> {
         self.base.map(|base| base + i64::from(self.results))
@@ -386,7 +712,7 @@ impl Frame {
 
 /// A type index names a signature declared elsewhere, so a walk with no module says so rather than
 /// guessing: a wrong height has every branch out of that frame unwind by the wrong amount
-fn block_arity(blockty: &BlockType, module: Option<&Module>) -> Option<(u32, u32)> {
+pub fn block_arity(blockty: &BlockType, module: Option<&Module>) -> Option<(u32, u32)> {
     match blockty {
         BlockType::Empty => Some((0, 0)),
         BlockType::Type(_) => Some((0, 1)),
@@ -424,6 +750,14 @@ fn open_frame(
         },
         params,
         results,
+        catches: Vec::new(),
+        handling: None,
+        delegate: None,
+        clauses: Vec::new(),
+        unresolved: false,
+        nesting: 0,
+        outside: None,
+        protecting: None,
     });
     frames.len() - 1
 }
@@ -447,6 +781,10 @@ enum Pending {
         frames: Vec<usize>,
         default: usize,
     },
+    Suspend {
+        handlers: Vec<(u32, usize)>,
+        next: u64,
+    },
 }
 
 /// The walk stops at the `end` closing the implicit function block, so `code` may run past it
@@ -460,21 +798,24 @@ pub fn recover(code: &[u8], start: u64, module: Option<&Module>) -> ControlFlow 
         ..Default::default()
     };
 
-    let mut frames = vec![Frame {
-        kind: FrameKind::Function,
-        body: start,
-        end: None,
-        otherwise: None,
-        // A function is entered with an empty operand stack whatever its parameters, since those
-        // are locals here, in a frame of their own
-        base: Some(0),
-        label_arity: 0,
-        params: 0,
-        results: 0,
-    }];
-    let mut open = vec![0usize];
+    let mut frames = Vec::new();
+    // A function is entered with an empty operand stack whatever its parameters, since those are
+    // locals here, in a frame of their own
+    let function = open_frame(
+        &mut frames,
+        FrameKind::Function,
+        start,
+        Some(0),
+        &BlockType::Empty,
+        None,
+    );
+    let mut open = vec![function];
     let mut pending: Vec<(u64, Option<i64>, Pending)> = Vec::new();
+    let mut raised: Vec<Raised> = Vec::new();
+    let mut protections = Protections::default();
+    let mut tries = 0u32;
     let mut offset = 0usize;
+    let identity = |tag: u32| module.map_or(tag, |module| module.tag_identity(tag));
 
     // `None` past a point the walk could not account for; every frame boundary restores it, so an
     // unknown operator costs the rest of its block rather than the rest of the body
@@ -517,6 +858,12 @@ pub fn recover(code: &[u8], start: u64, module: Option<&Module>) -> ControlFlow 
                     height = height.map(|h| h - 1);
                 }
                 let frame = open_frame(&mut frames, kind, next, height, blockty, module);
+                frames[frame].outside = protections.head;
+                if kind == FrameKind::Try {
+                    frames[frame].nesting = tries;
+                    tries += 1;
+                    protections.enter(&mut frames, frame);
+                }
                 flow.underflow |= frames[frame].base.is_none() && height.is_some();
                 open.push(frame);
                 if kind == FrameKind::If {
@@ -524,14 +871,35 @@ pub fn recover(code: &[u8], start: u64, module: Option<&Module>) -> ControlFlow 
                 }
             }
             Operator::TryTable { try_table } => {
+                let mut unresolved = false;
+                let clauses: Vec<(Option<u32>, bool, usize)> = try_table
+                    .catches
+                    .iter()
+                    .filter_map(|catch| {
+                        let (tag, exnref) = match *catch {
+                            Catch::One { tag, .. } => (Some(identity(tag)), false),
+                            Catch::OneRef { tag, .. } => (Some(identity(tag)), true),
+                            Catch::All { .. } => (None, false),
+                            Catch::AllRef { .. } => (None, true),
+                        };
+                        let label = frame_at(&open, insn::catch_label(catch));
+                        unresolved |= label.is_none();
+                        Some((tag, exnref, label?))
+                    })
+                    .collect();
                 let frame = open_frame(
                     &mut frames,
-                    FrameKind::Try,
+                    FrameKind::TryTable,
                     next,
                     height,
                     &try_table.ty,
                     module,
                 );
+                frames[frame].clauses = clauses;
+                frames[frame].unresolved = unresolved;
+                frames[frame].outside = protections.head;
+                protections.enter(&mut frames, frame);
+                flow.underflow |= frames[frame].base.is_none() && height.is_some();
                 open.push(frame);
             }
             Operator::Else => {
@@ -545,21 +913,30 @@ pub fn recover(code: &[u8], start: u64, module: Option<&Module>) -> ControlFlow 
             Operator::Catch { .. } | Operator::CatchAll => {
                 if let Some(&frame) = open.last() {
                     pending.push((addr, height, Pending::SkipElse(frame)));
-                    // A handler holds what its tag carries, and `catch_all` names no tag
-                    let carried = match &insn.op {
-                        Operator::Catch { tag_index } => {
-                            module.and_then(|module| module.tag_arity(*tag_index))
-                        }
-                        _ => Some(0),
+                    let tag = match insn.op {
+                        Operator::Catch { tag_index } => Some(identity(tag_index)),
+                        _ => None,
                     };
+                    frames[frame].catches.push((tag, next));
+                    frames[frame].handling = Some(tag);
+                    protections.leave(&mut frames, frame);
+                    // A handler holds what its tag carries, and `catch_all` names no tag
                     height = frames[frame]
                         .base
-                        .zip(carried)
+                        .zip(carried(module, tag))
                         .map(|(base, carried)| base + i64::from(carried));
                 }
             }
             Operator::End | Operator::Delegate { .. } => {
                 if let Some(frame) = open.pop() {
+                    protections.leave(&mut frames, frame);
+                    if frames[frame].kind == FrameKind::Try {
+                        tries -= 1;
+                    }
+                    if let Operator::Delegate { relative_depth } = insn.op {
+                        frames[frame].delegate = frame_at(&open, relative_depth)
+                            .map(|target| frames[target].protecting.or(frames[target].outside));
+                    }
                     frames[frame].end = Some(next);
                     height = frames[frame].end_height();
                     if frames[frame].kind == FrameKind::Function {
@@ -583,16 +960,10 @@ pub fn recover(code: &[u8], start: u64, module: Option<&Module>) -> ControlFlow 
             }
             // Every conditional branch names its label the same way; what it tests is the
             // lifter's problem rather than the graph's
-            Operator::BrIf { relative_depth }
-            | Operator::BrOnNull { relative_depth }
-            | Operator::BrOnNonNull { relative_depth }
-            | Operator::BrOnCast { relative_depth, .. }
-            | Operator::BrOnCastFail { relative_depth, .. }
-            | Operator::BrOnCastDescEq { relative_depth, .. }
-            | Operator::BrOnCastDescEqFail { relative_depth, .. } => {
+            op if let Some(relative_depth) = insn::conditional_label(op) => {
                 // The two edges leave different amounts behind, so they count separately
                 let taken = height.map(|h| h - lift::taken_pops(&insn.op));
-                match frame_at(&open, *relative_depth) {
+                match frame_at(&open, relative_depth) {
                     Some(frame) => pending.push((
                         addr,
                         taken,
@@ -635,16 +1006,64 @@ pub fn recover(code: &[u8], start: u64, module: Option<&Module>) -> ControlFlow 
                 flow.terminators.insert(addr, Terminator::Return);
                 height = None;
             }
-            Operator::Unreachable
-            | Operator::Throw { .. }
-            | Operator::ThrowRef
-            | Operator::Rethrow { .. } => {
+            Operator::Unreachable => {
+                flow.terminators.insert(addr, Terminator::Halt);
+                height = None;
+            }
+            Operator::Throw { .. } | Operator::ThrowRef | Operator::Rethrow { .. } => {
+                let handler = match insn.op {
+                    Operator::Rethrow { relative_depth } => frame_at(&open, relative_depth),
+                    _ => None,
+                };
+                let tag = match insn.op {
+                    Operator::Throw { tag_index } => Some(identity(tag_index)),
+                    _ => handler.and_then(|frame| frames[frame].handling.flatten()),
+                };
+                raised.push(Raised {
+                    at: addr,
+                    tag,
+                    caught: handler
+                        .map(|frame| frames[frame].nesting)
+                        .filter(|nesting| *nesting < CAUGHT_REGISTERS),
+                    protected: protections.head,
+                    throws: true,
+                });
                 flow.terminators.insert(addr, Terminator::Halt);
                 height = None;
             }
             // Everything else moves the stack by its own arity, which the lifter answers for so
             // there is one answer rather than two
             _ => {
+                if insn::raises(&insn.op) {
+                    raised.push(Raised {
+                        at: addr,
+                        tag: None,
+                        caught: None,
+                        protected: protections.head,
+                        throws: false,
+                    });
+                }
+                if let Some(table) = insn::resume_table(&insn.op) {
+                    let handlers: Option<Vec<(u32, usize)>> = table
+                        .handlers
+                        .iter()
+                        .filter_map(|handle| match *handle {
+                            Handle::OnLabel { tag, label } => {
+                                Some(frame_at(&open, label).map(|frame| (identity(tag), frame)))
+                            }
+                            Handle::OnSwitch { .. } => None,
+                        })
+                        .collect();
+                    match handlers {
+                        Some(handlers) if handlers.is_empty() => {}
+                        Some(handlers) => {
+                            pending.push((addr, height, Pending::Suspend { handlers, next }));
+                        }
+                        None => {
+                            flow.terminators.insert(addr, Terminator::Unresolved);
+                        }
+                    }
+                }
                 height = height.and_then(|h| {
                     let resolved = module.and_then(|module| module.resolve(&insn.op));
                     lift::stack_effect(&insn, resolved.as_ref()).map(|net| h - net)
@@ -661,8 +1080,185 @@ pub fn recover(code: &[u8], start: u64, module: Option<&Module>) -> ControlFlow 
     }
 
     resolve(&mut flow, &frames, pending);
+    catch(&mut flow, &frames, &protections.chain, raised, module, code);
     leaving_the_body_returns(&mut flow);
     flow
+}
+
+struct Raised {
+    at: u64,
+    tag: Option<u32>,
+    caught: Option<u32>,
+    protected: Option<usize>,
+    throws: bool,
+}
+
+fn carried(module: Option<&Module>, tag: Option<u32>) -> Option<u32> {
+    match tag {
+        Some(tag) => module.and_then(|module| module.tag_arity(tag)),
+        None => Some(0),
+    }
+}
+
+fn catch(
+    flow: &mut ControlFlow,
+    frames: &[Frame],
+    chain: &[Protection],
+    raised: Vec<Raised>,
+    module: Option<&Module>,
+    code: &[u8],
+) {
+    let handlers = handlers(frames, chain, module, code, flow.start);
+    for Raised {
+        at,
+        tag,
+        caught,
+        protected,
+        throws,
+    } in raised
+    {
+        let handlers = protected.and_then(|node| handlers[node].clone());
+        if throws || handlers.is_some() {
+            flow.dispatch.insert(
+                at,
+                Dispatch {
+                    tag,
+                    carried: carried(module, tag).unwrap_or(0),
+                    caught,
+                    handlers,
+                },
+            );
+        }
+    }
+}
+
+const MAX_SEARCH: usize = 64;
+
+fn handlers(
+    frames: &[Frame],
+    chain: &[Protection],
+    module: Option<&Module>,
+    code: &[u8],
+    start: u64,
+) -> Vec<Option<Arc<Handlers>>> {
+    let mut built: Vec<Option<Arc<Handlers>>> = Vec::with_capacity(chain.len());
+    for Protection { frame, outer } in chain {
+        let frame = &frames[*frame];
+        let outer = outer.and_then(|node| built[node].clone());
+        let handlers = match frame.delegate {
+            Some(target) => target.and_then(|node| built[node].clone()),
+            None => {
+                let mut clauses = Vec::new();
+                let mut by_tag = HashMap::new();
+                for clause in offered_by(frames, frame, module, code, start) {
+                    if let Some(tag) = clause.tag {
+                        if by_tag.contains_key(&tag) {
+                            continue;
+                        }
+                        by_tag.insert(tag, clauses.len());
+                    }
+                    let last = clause.tag.is_none();
+                    clauses.push(clause);
+                    if last {
+                        break;
+                    }
+                }
+                if clauses.is_empty() && !frame.unresolved {
+                    outer
+                } else {
+                    Some(Arc::new(Handlers {
+                        clauses,
+                        by_tag,
+                        unknown: frame.unresolved,
+                        outer,
+                    }))
+                }
+            }
+        };
+        built.push(handlers);
+    }
+    built
+}
+
+fn offered_by(
+    frames: &[Frame],
+    frame: &Frame,
+    module: Option<&Module>,
+    code: &[u8],
+    start: u64,
+) -> Vec<Clause> {
+    let carried = |tag: Option<u32>| carried(module, tag);
+    let pointer = module.and_then(|module| module.stack_pointer);
+    let restores = |target: Option<u64>, delivered: Option<u32>| {
+        restored_from(code, start, target?, pointer?, delivered?)
+    };
+    if frame.kind == FrameKind::TryTable {
+        frame
+            .clauses
+            .iter()
+            .map(|&(clause, exnref, to)| {
+                let arity = carried(clause);
+                let target = frames[to].label();
+                Clause {
+                    tag: clause,
+                    target,
+                    base: arity.and(frames[to].base),
+                    carried: arity.unwrap_or(0),
+                    exnref,
+                    keeps: None,
+                    restores: restores(target, arity.map(|arity| arity + u32::from(exnref))),
+                }
+            })
+            .collect()
+    } else {
+        frame
+            .catches
+            .iter()
+            .map(|&(clause, handler)| {
+                let arity = carried(clause);
+                Clause {
+                    tag: clause,
+                    target: Some(handler),
+                    base: arity.and(frame.base),
+                    carried: arity.unwrap_or(0),
+                    exnref: false,
+                    keeps: Some(frame.nesting).filter(|n| *n < CAUGHT_REGISTERS),
+                    restores: restores(Some(handler), arity),
+                }
+            })
+            .collect()
+    }
+}
+
+fn restored_from(
+    code: &[u8],
+    start: u64,
+    target: u64,
+    pointer: u32,
+    delivered: u32,
+) -> Option<u32> {
+    let mut offset = usize::try_from(target.checked_sub(start)?).ok()?;
+    let mut stored = HashSet::new();
+    for _ in 0..=delivered {
+        let insn = insn::decode_any(code.get(offset..)?)?;
+        offset += insn.len;
+        match insn.op {
+            Operator::LocalSet { local_index } => {
+                stored.insert(local_index);
+            }
+            Operator::Drop => {}
+            Operator::LocalGet { local_index } if !stored.contains(&local_index) => {
+                return match insn::decode_any(code.get(offset..)?)?.op {
+                    Operator::GlobalSet { global_index } if global_index == pointer => {
+                        Some(local_index)
+                    }
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// The outermost frame ends one byte past the body, so a label naming it is no address in this
@@ -703,16 +1299,17 @@ fn leaving_the_body_returns(flow: &mut ControlFlow) {
 
 /// Turns the recorded label references into addresses, now that every frame's end is known
 fn resolve(flow: &mut ControlFlow, frames: &[Frame], pending: Vec<(u64, Option<i64>, Pending)>) {
-    // A `loop` label restarts the body; everything else lands after its matching `end`
-    let target = |index: usize| -> Option<u64> {
-        let frame = &frames[index];
-        match frame.kind {
-            FrameKind::Loop => Some(frame.body),
-            FrameKind::Function => None,
-            _ => frame.end,
+    let target = |index: usize| frames[index].label();
+    let is_function = |index: usize| frames[index].kind == FrameKind::Function;
+    // An entry naming the outermost label returns; one that fails to resolve makes the whole set
+    // unusable, since no entry can be marked as going nowhere
+    let entry = |frame: usize| -> Option<Option<u64>> {
+        if is_function(frame) {
+            Some(None)
+        } else {
+            target(frame).map(Some)
         }
     };
-    let is_function = |index: usize| frames[index].kind == FrameKind::Function;
 
     // What a branch at `height` discards to land in `index`, and nothing where either height is
     // unknown or the two disagree, since a guessed unwind corrupts the stack rather than repairs it
@@ -746,9 +1343,20 @@ fn resolve(flow: &mut ControlFlow, frames: &[Frame], pending: Vec<(u64, Option<i
                     }
                 }));
             }
+            Pending::Suspend { handlers, .. } => {
+                unwinds.extend(handlers.iter().map(|(_, frame)| {
+                    if is_function(*frame) {
+                        Unwind::default()
+                    } else {
+                        let arity = i64::from(frames[*frame].label_arity);
+                        unwind(*frame, height.map(|height| height + arity))
+                    }
+                }));
+            }
             _ => {}
         }
-        if unwinds.iter().any(|unwind| !unwind.is_empty()) {
+        let carries = matches!(branch, Pending::Suspend { .. });
+        if carries || unwinds.iter().any(|unwind| !unwind.is_empty()) {
             flow.unwinds.insert(addr, unwinds);
         }
 
@@ -781,16 +1389,6 @@ fn resolve(flow: &mut ControlFlow, frames: &[Frame], pending: Vec<(u64, Option<i
                 frames: entries,
                 default,
             } => {
-                // An entry naming the outermost label returns; one that fails to resolve makes
-                // the whole table unusable, since no index can be marked as going nowhere
-                let entry = |frame: usize| -> Option<Option<u64>> {
-                    if is_function(frame) {
-                        Some(None)
-                    } else {
-                        target(frame).map(Some)
-                    }
-                };
-
                 let targets: Option<Vec<Option<u64>>> =
                     entries.iter().map(|frame| entry(*frame)).collect();
                 match (targets, entry(default)) {
@@ -798,6 +1396,14 @@ fn resolve(flow: &mut ControlFlow, frames: &[Frame], pending: Vec<(u64, Option<i
                     _ => Terminator::Unresolved,
                 }
             }
+            Pending::Suspend { handlers, next } => handlers
+                .iter()
+                .map(|&(tag, frame)| Some((tag, entry(frame)?)))
+                .collect::<Option<Vec<_>>>()
+                .map_or(Terminator::Unresolved, |handlers| Terminator::Suspend {
+                    handlers,
+                    next,
+                }),
         };
 
         flow.terminators.insert(addr, terminator);
@@ -1121,6 +1727,497 @@ mod tests {
         assert_eq!(blocks[0].edges, [Edge::Unconditional(2)]);
         assert_eq!(blocks[1].start, 2);
         assert_eq!(blocks[1].edges, [Edge::Unconditional(2)]);
+    }
+
+    #[test]
+    fn code_nothing_reaches_is_not_handed_over() {
+        let flow = recover(&[0x02, 0x40, 0x0c, 0x00, 0x0b, 0x0b], 0x100);
+        let all: Vec<u64> = flow.blocks().iter().map(|block| block.start).collect();
+        let reached: Vec<u64> = flow
+            .reachable_blocks()
+            .iter()
+            .map(|block| block.start)
+            .collect();
+        assert_eq!(all, [0x100, 0x104, 0x105]);
+        assert_eq!(
+            reached,
+            [0x100, 0x105],
+            "the end after the branch never runs"
+        );
+    }
+
+    #[test]
+    fn a_handler_is_handed_over_when_something_it_covers_can_throw() {
+        let reached = |code: &[u8]| -> Vec<u64> {
+            recover(code, 0x100)
+                .reachable_blocks()
+                .iter()
+                .map(|block| block.start)
+                .collect()
+        };
+        assert_eq!(
+            reached(&[0x06, 0x40, 0x10, 0x00, 0x19, 0x01, 0x0b, 0x0b]),
+            [0x100, 0x105, 0x107]
+        );
+        assert_eq!(
+            reached(&[0x02, 0x40, 0x0d, 0x00, 0x01, 0xff]),
+            [0x100, 0x104],
+            "a body cut short keeps every block, whether or not an edge to it was recovered"
+        );
+        assert_eq!(
+            reached(&[0x06, 0x40, 0x01, 0x19, 0x01, 0x0b, 0x0b]),
+            [0x100, 0x106],
+            "nothing in the body throws, so the handler never runs"
+        );
+        assert_eq!(
+            reached(&[
+                0x02, 0x40, 0x0c, 0x00, 0x06, 0x40, 0x08, 0x00, 0x19, 0x01, 0x0b, 0x0b, 0x0b
+            ]),
+            [0x100, 0x10c],
+            "the only throw is never reached"
+        );
+
+        let (_, flow) = recover_last(
+            r#"(module (type $ft (func)) (type $ct (cont $ft)) (func $f) (elem declare func $f)
+                 (func
+                   try
+                     (resume $ct (cont.new $ct (ref.func $f)))
+                   catch_all
+                   end))"#,
+        );
+        let handler = dispatch_at(&flow, 0).offered().clauses[0]
+            .target
+            .expect("a handler");
+        assert!(
+            flow.reachable_blocks()
+                .iter()
+                .any(|block| block.start == handler),
+            "a continuation can throw out of a resume"
+        );
+    }
+
+    fn recover_last(text: &str) -> (Module, ControlFlow) {
+        let image = wat::parse_str(text).expect("the fixture assembles");
+        let module = crate::module::parse(&image, 0).expect("parses");
+        let (_, info) = module.functions().last().expect("a function");
+        let code = &image[info.entry as usize..info.end as usize];
+        let flow = super::recover(code, info.entry, Some(&module));
+        (module, flow)
+    }
+
+    fn dispatch_at(flow: &ControlFlow, nth: usize) -> &Dispatch {
+        flow.dispatch.values().nth(nth).expect("a dispatch")
+    }
+
+    #[test]
+    fn a_call_in_a_try_table_can_land_on_each_clause_label_with_the_payload() {
+        let (_, flow) = recover_last(
+            r#"(module (tag $e (param i32)) (func $f)
+                 (func (result i32)
+                   (block $h (result i32)
+                     (drop
+                       (block $any (result exnref)
+                         (try_table (catch $e $h) (catch_all_ref $any) (call $f))
+                         (return (i32.const 0))))
+                     (i32.const 1))))"#,
+        );
+        let dispatch = dispatch_at(&flow, 0);
+        assert_eq!(dispatch.tag, None);
+        let [caught, all] = dispatch.offered().clauses[..] else {
+            panic!("{dispatch:?}");
+        };
+        assert_eq!(
+            (caught.tag, caught.base, caught.carried),
+            (Some(0), Some(0), 1)
+        );
+        assert_eq!(
+            (all.tag, all.base, all.carried, all.exnref),
+            (None, Some(0), 0, true)
+        );
+        assert_ne!(caught.target, all.target);
+        let starts: Vec<u64> = flow.blocks().iter().map(|block| block.start).collect();
+        for clause in [caught, all] {
+            assert!(
+                starts.contains(&clause.target.expect("inside the body")),
+                "a clause's label starts a block even though no branch names it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resume_lands_on_each_handler_label_with_what_the_suspension_carries() {
+        let (_, flow) = recover_last(
+            r#"(module (type $f (func (result i32))) (type $c (cont $f)) (tag $y (param i64))
+                 (func $g (result i32) (i32.const 0)) (elem declare func $g)
+                 (func (result i32)
+                   (block $h (result i64 (ref null $c))
+                     (i32.const 7)
+                     (resume $c (on $y $h) (cont.new $c (ref.func $g)))
+                     (return))
+                   (drop) (drop) (i32.const 1)))"#,
+        );
+        let (&at, terminator) = flow
+            .terminators
+            .iter()
+            .find(|(_, terminator)| matches!(terminator, Terminator::Suspend { .. }))
+            .expect("the resume");
+        let Terminator::Suspend { handlers, next } = terminator else {
+            unreachable!();
+        };
+        let [(0, Some(handler))] = handlers[..] else {
+            panic!("{handlers:?}");
+        };
+        assert_eq!(flow.next_address(at), Some(*next));
+        assert_eq!(
+            flow.unwinds.get(&at).map(Vec::as_slice),
+            Some(&[Unwind { keep: 2, drop: 2 }][..]),
+            "an i64 and a continuation where the block began"
+        );
+        let index = flow
+            .instructions
+            .binary_search_by_key(next, |(start, _)| *start)
+            .expect("an instruction");
+        assert_eq!(
+            flow.heights[index],
+            Some(2),
+            "the resume's result over the 7"
+        );
+        let reached: Vec<u64> = flow.reachable_blocks().iter().map(|b| b.start).collect();
+        assert!(reached.contains(&handler) && reached.contains(next));
+    }
+
+    #[test]
+    fn a_clause_naming_the_function_label_returns_the_payload() {
+        let (_, flow) = recover_last(
+            r#"(module (tag $e (param i32)) (func $f)
+                 (func (result i32)
+                   (try_table (catch $e 0) (call $f))
+                   (i32.const 0)))"#,
+        );
+        let [clause] = dispatch_at(&flow, 0).offered().clauses[..] else {
+            panic!("{flow:?}");
+        };
+        assert_eq!(
+            (clause.target, clause.base, clause.carried),
+            (None, Some(0), 1)
+        );
+    }
+
+    #[test]
+    fn a_delegated_try_hands_its_exceptions_to_the_try_it_names() {
+        let (_, flow) = recover_last(
+            r#"(module (tag $e (param i32)) (func $f)
+                 (func
+                   try
+                     try
+                       call $f
+                     delegate 0
+                   catch $e
+                     drop
+                   catch_all
+                   end))"#,
+        );
+        let offered = dispatch_at(&flow, 0).offered().clauses;
+        let tags: Vec<_> = offered.iter().map(|clause| clause.tag).collect();
+        assert_eq!(tags, [Some(0), None]);
+        assert_eq!(offered[0].carried, 1);
+        let reached: Vec<u64> = flow.reachable_blocks().iter().map(|b| b.start).collect();
+        for clause in offered {
+            assert!(reached.contains(&clause.target.expect("a handler")));
+        }
+    }
+
+    #[test]
+    fn a_delegate_to_a_label_that_is_no_try_goes_to_the_handlers_around_it() {
+        let tags = |inner: &str| {
+            let (_, flow) = recover_last(&format!(
+                r#"(module (tag $e) (func $f)
+                     (func
+                       try
+                         block $b
+                           try
+                             try
+                               call $f
+                             delegate {inner}
+                           catch $e
+                           end
+                         end
+                       catch_all
+                       end))"#
+            ));
+            flow.dispatch.values().next().map(|dispatch| {
+                let offered = dispatch.offered();
+                assert!(!offered.truncated);
+                offered
+                    .clauses
+                    .iter()
+                    .map(|clause| clause.tag)
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(tags("0"), Some(vec![Some(0), None]), "the try just outside");
+        assert_eq!(
+            tags("1"),
+            Some(vec![None]),
+            "a block, past the try inside it"
+        );
+        assert_eq!(
+            tags("3"),
+            None,
+            "the function itself, so nothing here handles it"
+        );
+    }
+
+    #[test]
+    fn handlers_nested_past_the_limit_are_left_unknown() {
+        let (_, flow) = recover_last(&format!(
+            "(module (tag $e) (func $f) (func {} call $f {}))",
+            "try ".repeat(MAX_SEARCH + 8),
+            "catch $e end ".repeat(MAX_SEARCH + 8),
+        ));
+        let offered = dispatch_at(&flow, 0).offered();
+        assert!(offered.truncated);
+        assert_eq!(offered.clauses.len(), 1, "the one tag, caught innermost");
+    }
+
+    #[test]
+    fn a_deep_chain_of_handlers_is_compared_and_freed_without_recursing() {
+        let text = format!(
+            "(module (func $f) (func {} call $f {}))",
+            "try ".repeat(20_000),
+            "catch_all end ".repeat(20_000),
+        );
+        let small = std::thread::Builder::new().stack_size(256 << 10);
+        let run = small.spawn(move || {
+            let (_, first) = recover_last(&text);
+            let (_, second) = recover_last(&text);
+            let same = dispatch_at(&first, 0) == dispatch_at(&second, 0);
+            drop((first, second));
+            same
+        });
+        assert!(run.expect("spawns").join().expect("did not overflow"));
+    }
+
+    #[test]
+    fn handlers_past_the_search_limit_still_start_reachable_blocks() {
+        let depth = MAX_SEARCH + 8;
+        let tags: String = (0..depth).map(|nth| format!("(tag $t{nth})")).collect();
+        let handlers: String = (0..depth)
+            .rev()
+            .map(|nth| format!("catch $t{nth} end "))
+            .collect();
+        let (_, flow) = recover_last(&format!(
+            "(module {tags} (func $f) (func {} call $f {handlers}))",
+            "try ".repeat(depth)
+        ));
+        let offered = dispatch_at(&flow, 0).offered();
+        assert!(offered.truncated);
+        let reached: BTreeSet<u64> = flow
+            .reachable_blocks()
+            .iter()
+            .map(|block| block.start)
+            .collect();
+        let mut visited = HashSet::new();
+        let landings = dispatch_at(&flow, 0).landings(&mut visited);
+        assert_eq!(landings.len(), depth);
+        assert!(landings.iter().all(|at| reached.contains(at)));
+    }
+
+    #[test]
+    fn a_clause_whose_label_does_not_resolve_leaves_the_search_unknown() {
+        let (_, flow) =
+            recover_last("(module (func $f) (func (block (try_table (catch_all 5) (call $f)))))");
+        let offered = dispatch_at(&flow, 0).offered();
+        assert!(offered.truncated && offered.clauses.is_empty());
+    }
+
+    #[test]
+    fn a_throw_goes_straight_to_the_first_clause_for_its_tag() {
+        let (_, flow) = recover_last(
+            r#"(module (tag $a) (tag $b (param i32 i64))
+                 (func
+                   try
+                     i32.const 1
+                     i64.const 2
+                     throw $b
+                   catch $a
+                   catch $b
+                     drop
+                     drop
+                   catch_all
+                   end))"#,
+        );
+        let dispatch = dispatch_at(&flow, 0);
+        assert_eq!((dispatch.tag, dispatch.carried), (Some(1), 2));
+        let [only] = dispatch.offered().clauses[..] else {
+            panic!("{dispatch:?}");
+        };
+        assert_eq!((only.tag, only.carried), (Some(1), 2));
+    }
+
+    #[test]
+    fn imports_of_one_tag_are_caught_as_one_tag() {
+        let caught = |second: &str| {
+            let (_, flow) = recover_last(&format!(
+                r#"(module (import "env" "e" (tag $a (param i32)))
+                     (import "env" "{second}" (tag $b (param i32)))
+                     (func
+                       try
+                         (throw $a (i32.const 1))
+                       catch $b
+                         drop
+                       end))"#
+            ));
+            let dispatch = dispatch_at(&flow, 0);
+            let offered = dispatch.offered();
+            (
+                dispatch.tag,
+                offered
+                    .clauses
+                    .iter()
+                    .map(|clause| clause.tag)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(caught("e"), (Some(0), vec![Some(0)]));
+        assert_eq!(
+            caught("f"),
+            (Some(0), vec![]),
+            "another import is another tag"
+        );
+    }
+
+    #[test]
+    fn tries_with_no_handlers_of_their_own_share_the_ones_around_them() {
+        let (_, flow) = recover_last(
+            r#"(module (tag $e (param i32)) (func $f)
+                 (func
+                   try
+                     try call $f end
+                     try call $f end
+                   catch $e
+                     drop
+                   catch_all
+                   end))"#,
+        );
+        let [first, second] = [dispatch_at(&flow, 0), dispatch_at(&flow, 1)];
+        let (Some(first_handlers), Some(second_handlers)) = (&first.handlers, &second.handlers)
+        else {
+            panic!("{first:?} {second:?}");
+        };
+        assert!(Arc::ptr_eq(first_handlers, second_handlers));
+        assert_eq!(first.offered().clauses.len(), 2);
+    }
+
+    #[test]
+    fn a_handler_that_puts_the_stack_pointer_back_first_says_from_which_local() {
+        let restores = |body: &str| {
+            let (_, flow) = recover_last(&format!(
+                r#"(module (memory 1) (global $__stack_pointer (mut i32) (i32.const 4096))
+                     (global $other (mut i32) (i32.const 0)) (tag $e (param i32)) (func $f)
+                     (func (local i32 i32 exnref) {body}))"#
+            ));
+            let offered = dispatch_at(&flow, 0).offered();
+            offered
+                .clauses
+                .iter()
+                .map(|clause| clause.restores)
+                .collect::<Vec<_>>()
+        };
+        let legacy = |handler: &str| restores(&format!("try call $f {handler} end"));
+        assert_eq!(
+            legacy("catch_all local.get 0 global.set $__stack_pointer"),
+            [Some(0)]
+        );
+        assert_eq!(
+            legacy("catch $e local.set 1 local.get 0 global.set $__stack_pointer"),
+            [Some(0)],
+            "once what was caught is put away"
+        );
+        assert_eq!(
+            legacy("catch $e drop local.get 0 global.set $__stack_pointer"),
+            [Some(0)]
+        );
+        assert_eq!(
+            legacy("catch $e local.set 0 local.get 0 global.set $__stack_pointer"),
+            [None],
+            "the local holds what was caught by then"
+        );
+        assert_eq!(
+            legacy("catch_all call $f local.get 0 global.set $__stack_pointer"),
+            [None],
+            "a call first sees whatever the throw left"
+        );
+        assert_eq!(legacy("catch_all local.get 0 global.set $other"), [None]);
+        assert_eq!(
+            restores(
+                "(block $h (result exnref) (try_table (catch_all_ref $h) (call $f)) (return))
+                 (local.set 2) (local.get 1) (global.set $__stack_pointer)"
+            ),
+            [Some(1)],
+            "a clause's label is where its handler starts"
+        );
+        assert_eq!(
+            restores(
+                "(block $h (result exnref) (try_table (catch_all_ref $h) (call $f)) (return))
+                 (throw_ref)"
+            ),
+            [None]
+        );
+    }
+
+    #[test]
+    fn a_throw_nothing_catches_is_still_described() {
+        let (_, flow) =
+            recover_last(r#"(module (tag $e (param i32)) (func (throw $e (i32.const 1))))"#);
+        let dispatch = dispatch_at(&flow, 0);
+        assert_eq!((dispatch.tag, dispatch.carried), (Some(0), 1));
+        assert!(dispatch.offered().clauses.is_empty());
+    }
+
+    #[test]
+    fn a_rethrow_knows_the_tag_its_handler_caught_and_skips_that_handler() {
+        let (_, flow) = recover_last(
+            r#"(module (tag $a) (tag $b)
+                 (func
+                   try
+                     try
+                       call 0
+                     catch $b
+                       rethrow 0
+                     end
+                   catch $a
+                   catch $b
+                   end))"#,
+        );
+        let rethrow = flow
+            .dispatch
+            .values()
+            .find(|dispatch| dispatch.tag.is_some())
+            .expect("the rethrow");
+        let [outer] = rethrow.offered().clauses[..] else {
+            panic!("{rethrow:?}");
+        };
+        assert_eq!((rethrow.tag, outer.tag), (Some(1), Some(1)));
+        assert_eq!(rethrow.caught, Some(1), "the inner handler is one try deep");
+        assert_eq!(outer.keeps, Some(0));
+
+        let call = flow
+            .dispatch
+            .values()
+            .find(|dispatch| dispatch.tag.is_none())
+            .expect("the call");
+        let tags: Vec<_> = call
+            .offered()
+            .clauses
+            .iter()
+            .map(|clause| clause.tag)
+            .collect();
+        assert_eq!(
+            tags,
+            [Some(1), Some(0)],
+            "the outer $b is shadowed by the inner one"
+        );
     }
 
     #[test]
